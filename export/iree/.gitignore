@@ -1,0 +1,16 @@
+# IREE export build artefacts — do not commit
+*.vmfb
+*.mlir
+*.mlirbc
+*.safetensors
+
+# Shape tracing outputs
+shapes_report.json
+
+# Exported ONNX intermediates (if generated)
+*.onnx
+
+# Python cache
+__pycache__/
+*.pyc
+.venv/

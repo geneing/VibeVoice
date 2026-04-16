@@ -1,0 +1,34 @@
+{
+  "speakers": [
+    "en-Carter_man",
+    "en-Emma_woman",
+    "en-Mike_man"
+  ],
+  "sentences": [
+    {
+      "id": "s1",
+      "text": "Hello, this is a test of the speech synthesis system.",
+      "desc": "short"
+    },
+    {
+      "id": "s2",
+      "text": "The weather today is sunny with a high of seventy five degrees.",
+      "desc": "medium"
+    },
+    {
+      "id": "s3",
+      "text": "The model uses a transformer-based architecture with five diffusion steps for real-time synthesis.",
+      "desc": "technical"
+    },
+    {
+      "id": "s4",
+      "text": "Would you like to hear more about the VibeVoice streaming model?",
+      "desc": "question"
+    },
+    {
+      "id": "s5",
+      "text": "VibeVoice is a novel framework for generating expressive long-form speech using a next-token diffusion approach.",
+      "desc": "long"
+    }
+  ]
+}

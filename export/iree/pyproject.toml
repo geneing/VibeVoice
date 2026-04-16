@@ -1,0 +1,25 @@
+[project]
+name = "vibevoice-iree-export"
+version = "0.1.0"
+description = "IREE export of VibeVoice-Realtime-0.5B for Android mobile deployment"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "iree-turbine",
+    "torch",
+    "numpy",
+    "soundfile",
+    "transformers>=4.51.3,<5.0.0",
+    "accelerate",
+    "diffusers",
+    "scipy",
+    "librosa",
+    "vibevoice",
+    # Evaluation metrics
+    "pesq",
+    "pystoi",
+    "pymcd",
+    "torchmetrics",
+]
+
+[tool.uv.sources]
+vibevoice = { path = "../..", editable = true }
