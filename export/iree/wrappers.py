@@ -223,6 +223,17 @@ class DiffusionHeadWrapper(nn.Module):
 
 # ── Vocoder wrapper ───────────────────────────────────────────────────────────
 
+def _unwrap_no_grad(fn):
+    """
+    Recursively unwrap @torch.no_grad() (and similar) decorators.
+    PyTorch's no_grad sets __wrapped__ on the decorated function.
+    Returns the innermost original function.
+    """
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    return fn
+
+
 class VocoderWrapper(nn.Module):
     """
     Decode a sequence of speech latents to a waveform.
@@ -248,16 +259,18 @@ class VocoderWrapper(nn.Module):
         self.acoustic_tokenizer = acoustic_tokenizer
         self.register_buffer("scaling_factor", scaling_factor.clone().detach())
         self.register_buffer("bias_factor",    bias_factor.clone().detach())
+        # Unwrap @torch.no_grad() on the decode method to prevent
+        # 'wrap_with_set_grad_enabled' HOPs that iree-turbine cannot lower.
+        cls_decode = type(acoustic_tokenizer).decode
+        self._raw_decode = _unwrap_no_grad(cls_decode)
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
         scaled = latents / self.scaling_factor - self.bias_factor
-        # The acoustic_tokenizer decode interface varies by model version.
-        # Try the simplest form first; use_cache=False avoids the streaming path.
+        # Call the unwrapped decode directly (bypasses @torch.no_grad decorator).
         try:
-            return self.acoustic_tokenizer.decode(scaled, use_cache=False)
+            return self._raw_decode(self.acoustic_tokenizer, scaled, use_cache=False)
         except TypeError:
-            # Fallback: some versions only accept positional arg
-            return self.acoustic_tokenizer.decode(scaled)
+            return self._raw_decode(self.acoustic_tokenizer, scaled)
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────

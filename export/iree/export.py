@@ -28,11 +28,176 @@ import copy
 import json
 import sys
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import torch
+
+
+# ── Patch Qwen2 RoPE to remove un-exportable HOPs ────────────────────────────
+# Qwen2RotaryEmbedding.forward uses @torch.no_grad() and
+# torch.autocast(enabled=False).  Both produce higher-order ops
+# ('wrap_with_set_grad_enabled', 'wrap_with_autocast') that iree-turbine's
+# FxImporter does not implement.  The autocast is a no-op (all tensors are
+# already cast to .float()), and no_grad is irrelevant at inference time, so
+# we replace the method with a semantically identical HOP-free version only
+# for the duration of torch.export.
+
+
+def _rope_forward_clean(self, x: torch.Tensor, position_ids: torch.Tensor):
+    """Drop-in replacement for Qwen2RotaryEmbedding.forward without HOPs."""
+    inv_freq_expanded = (
+        self.inv_freq[None, :, None]
+        .float()
+        .expand(position_ids.shape[0], -1, 1)
+        .to(x.device)
+    )
+    position_ids_expanded = position_ids[:, None, :].float()
+    # autocast(enabled=False) is a pass-through; .float() already handles dtype.
+    freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos() * self.attention_scaling
+    sin = emb.sin() * self.attention_scaling
+    return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+@contextmanager
+def _patch_qwen2_rope():
+    """Context manager: swap Qwen2RotaryEmbedding.forward for HOP-free version."""
+    try:
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+    except ImportError:
+        yield
+        return
+    orig = Qwen2RotaryEmbedding.forward
+    Qwen2RotaryEmbedding.forward = _rope_forward_clean
+    try:
+        yield
+    finally:
+        Qwen2RotaryEmbedding.forward = orig
+
+
+def _causal_mask_clean(
+    config,
+    input_embeds: torch.Tensor,
+    attention_mask,
+    cache_position: torch.Tensor,
+    past_key_values,
+    **kwargs,
+) -> torch.Tensor:
+    """
+    HOP-free replacement for transformers.masking_utils.create_causal_mask.
+
+    The stock implementation uses torch.vmap (via mask_interface) which produces
+    'wrap_with_set_grad_enabled' and '_vmap_increment_nesting' HOPs that
+    iree-turbine cannot lower.  This version computes an equivalent 4D float
+    causal mask using only basic tensor ops.
+
+    Returns a (batch, 1, q_len, kv_len) float mask:  0 = attend, -inf = mask.
+    """
+    batch_size = input_embeds.shape[0]
+    q_len      = input_embeds.shape[1]
+    dtype      = input_embeds.dtype
+    device     = input_embeds.device
+
+    # Determine past KV length from the cache object.
+    kv_past = 0
+    if (past_key_values is not None
+            and hasattr(past_key_values, "key_cache")
+            and len(past_key_values.key_cache) > 0
+            and past_key_values.key_cache[0].shape[2] > 0):
+        kv_past = past_key_values.key_cache[0].shape[2]
+
+    kv_len = kv_past + q_len  # total keys available to attend to
+
+    # cache_position[i] = absolute position of query token i.
+    # Token i may attend to key k iff k <= cache_position[i].
+    arange_kv = torch.arange(kv_len, device=device, dtype=torch.long)  # (kv_len,)
+    attend = arange_kv.unsqueeze(0) <= cache_position.unsqueeze(-1)     # (q_len, kv_len)
+
+    # Convert bool mask to float: 0.0 where attend=True, -inf where False.
+    neg_inf = torch.finfo(dtype).min if dtype != torch.float32 else float("-inf")
+    float_mask = torch.zeros(q_len, kv_len, dtype=dtype, device=device)
+    float_mask = float_mask.masked_fill(~attend, neg_inf)
+
+    return float_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, q_len, kv_len)
+
+
+@contextmanager
+def _patch_create_causal_mask():
+    """Context manager: swap transformers create_causal_mask for HOP-free version."""
+    try:
+        import transformers.masking_utils as mu
+        import transformers.models.qwen2.modeling_qwen2 as qm
+    except ImportError:
+        yield
+        return
+
+    orig_mu = mu.create_causal_mask
+    orig_qm = getattr(qm, "create_causal_mask", None)
+
+    mu.create_causal_mask = _causal_mask_clean
+    if orig_qm is not None:
+        qm.create_causal_mask = _causal_mask_clean
+    try:
+        yield
+    finally:
+        mu.create_causal_mask = orig_mu
+        if orig_qm is not None:
+            qm.create_causal_mask = orig_qm
+
+
+def _preload_torch_decompositions() -> None:
+    """
+    Force-load PyTorch's op decomposition table before torch.export.
+
+    If this is not done, `lazy_load_decompositions` appears as a call_function
+    node in the exported FX graph.  iree-turbine's FxImporter does not implement
+    this node and raises NotImplementedError.  Calling the function once is
+    idempotent — it replaces itself with a no-op afterwards.
+    """
+    try:
+        from torch._decomp import lazy_load_decompositions  # type: ignore[attr-defined]
+        lazy_load_decompositions()
+    except (ImportError, AttributeError):
+        pass
+
+
+def _remove_lazy_load_nodes(exported_prog: torch.export.ExportedProgram) -> torch.export.ExportedProgram:
+    """
+    Remove `lazy_load_decompositions` call_function nodes from the exported graph.
+
+    These nodes have no output (return None) and no users; they are pure side
+    effects that pre-load PyTorch decompositions.  iree-turbine's FxImporter
+    raises NotImplementedError for them.  Erasing them is safe because the
+    decompositions are already loaded by the time we reach the compile step.
+    """
+    graph = exported_prog.graph_module.graph
+    to_erase = [
+        n for n in list(graph.nodes)
+        if n.op == "call_function"
+        and "lazy_load_decompositions" in getattr(
+            n.target, "__qualname__", repr(n.target)
+        )
+    ]
+
+    if not to_erase:
+        return exported_prog
+
+    for node in to_erase:
+        # These nodes return None and should have no users.
+        # If somehow a user exists, redirect it to the first available constant.
+        if node.users:
+            node.replace_all_uses_with(
+                next(iter(node.users))  # type: ignore[arg-type]  # fallback
+            )
+        graph.erase_node(node)
+
+    print(f"  [graph-patch] Removed {len(to_erase)} lazy_load_decompositions node(s).")
+    exported_prog.graph_module.recompile()
+    return exported_prog
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXPORT_DIR = Path(__file__).parent
@@ -212,39 +377,49 @@ def export_component(
     exported_prog = None
     dynamic_export_succeeded = False
 
-    if dynamic_shapes is not None:
-        try:
-            print(f"  [torch.export] {name} (dynamic shapes) …")
-            exported_prog = torch.export.export(
-                wrapper,
-                example_inputs,
-                dynamic_shapes=dynamic_shapes,
-                strict=False,
-            )
-            dynamic_export_succeeded = True
-            print(f"  [torch.export] {name} ✓ (dynamic)")
-        except Exception as exc:
-            warn = (f"torch.export with dynamic_shapes failed for {name}: {exc!r}. "
-                    "Falling back to static shapes from example_inputs.")
-            print(f"  WARNING: {warn}", file=sys.stderr)
-            manifest_entry["warnings"].append(warn)
+    # Pre-load decompositions to prevent lazy_load_decompositions nodes in graph.
+    _preload_torch_decompositions()
 
-    if exported_prog is None:
-        # Static fallback
-        try:
-            print(f"  [torch.export] {name} (static shapes, fallback) …")
-            exported_prog = torch.export.export(
-                wrapper,
-                example_inputs,
-                strict=False,
-            )
-            print(f"  [torch.export] {name} ✓ (static)")
-        except Exception as exc:
-            err = f"torch.export failed entirely for {name}: {exc}"
-            print(f"  ERROR: {err}", file=sys.stderr)
-            traceback.print_exc()
-            manifest_entry["error"] = err
-            return manifest_entry
+    # Patch Qwen2 RoPE and create_causal_mask for the duration of torch.export
+    # to eliminate HOPs that iree-turbine cannot lower.
+    with _patch_qwen2_rope(), _patch_create_causal_mask():
+        if dynamic_shapes is not None:
+            try:
+                print(f"  [torch.export] {name} (dynamic shapes) …")
+                exported_prog = torch.export.export(
+                    wrapper,
+                    example_inputs,
+                    dynamic_shapes=dynamic_shapes,
+                    strict=False,
+                )
+                dynamic_export_succeeded = True
+                print(f"  [torch.export] {name} ✓ (dynamic)")
+            except Exception as exc:
+                warn = (f"torch.export with dynamic_shapes failed for {name}: {exc!r}. "
+                        "Falling back to static shapes from example_inputs.")
+                print(f"  WARNING: {warn}", file=sys.stderr)
+                manifest_entry["warnings"].append(warn)
+
+        if exported_prog is None:
+            # Static fallback
+            try:
+                print(f"  [torch.export] {name} (static shapes, fallback) …")
+                exported_prog = torch.export.export(
+                    wrapper,
+                    example_inputs,
+                    strict=False,
+                )
+                print(f"  [torch.export] {name} ✓ (static)")
+            except Exception as exc:
+                err = f"torch.export failed entirely for {name}: {exc}"
+                print(f"  ERROR: {err}", file=sys.stderr)
+                traceback.print_exc()
+                manifest_entry["error"] = err
+                return manifest_entry
+
+    # 1b. Post-process: remove lazy_load_decompositions nodes that iree-turbine
+    #     cannot lower.  These are pure side-effect calls with no return value.
+    exported_prog = _remove_lazy_load_nodes(exported_prog)
 
     # 2. iree-turbine AOT  ─────────────────────────────────────────────────────
     try:
@@ -310,10 +485,12 @@ def main() -> None:
     from wrappers import build_wrappers
 
     print(f"Loading model from {args.model_path}")
+    # Use eager attention: SDPA internally uses torch.autocast which creates
+    # a 'wrap_with_autocast' higher-order op that iree-turbine cannot lower.
     model = VibeVoiceStreamingForConditionalGenerationInference.from_pretrained(
         args.model_path,
         torch_dtype=torch.float32,
-        attn_implementation="sdpa",
+        attn_implementation="eager",
         device_map="cpu",
     )
     model.eval()
