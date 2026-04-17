@@ -1,0 +1,70 @@
+{
+  "method": "iree",
+  "timestamp": "2026-04-17T18:50:00.040812+00:00",
+  "model_path": "/home/eingerman/Projects/TTS/VibeVoice/model",
+  "backends": [
+    "cpu"
+  ],
+  "components": {
+    "text_lm": {
+      "component": "text_lm",
+      "dynamic_shapes": true,
+      "backends": {
+        "cpu": {
+          "file": "text_lm_cpu.vmfb",
+          "size_mb": 746.95,
+          "iree_target": "llvm-cpu"
+        }
+      },
+      "warnings": []
+    },
+    "tts_lm": {
+      "component": "tts_lm",
+      "dynamic_shapes": true,
+      "backends": {
+        "cpu": {
+          "file": "tts_lm_cpu.vmfb",
+          "size_mb": 1140.92,
+          "iree_target": "llvm-cpu"
+        }
+      },
+      "warnings": []
+    },
+    "acoustic_connector": {
+      "component": "acoustic_connector",
+      "dynamic_shapes": false,
+      "backends": {
+        "cpu": {
+          "file": "acoustic_connector_cpu.vmfb",
+          "size_mb": 3.3,
+          "iree_target": "llvm-cpu"
+        }
+      },
+      "warnings": []
+    },
+    "diffusion_head": {
+      "component": "diffusion_head",
+      "dynamic_shapes": false,
+      "backends": {
+        "cpu": {
+          "file": "diffusion_head_cpu.vmfb",
+          "size_mb": 160.6,
+          "iree_target": "llvm-cpu"
+        }
+      },
+      "warnings": []
+    },
+    "vocoder": {
+      "component": "vocoder",
+      "dynamic_shapes": false,
+      "backends": {
+        "cpu": {
+          "file": "vocoder_cpu.vmfb",
+          "size_mb": 1311.2,
+          "iree_target": "llvm-cpu"
+        }
+      },
+      "warnings": []
+    }
+  }
+}
