@@ -264,10 +264,11 @@ def _spec_text_lm(wrappers: dict) -> dict:
     seq_dim = _dim("seq")
     kv_dim  = _dim("kv_seq_lm")
 
+    # For variadic *flat_kv, KV shapes must be a tuple (matching example_inputs[2])
     dynamic_shapes = (
         {1: seq_dim},                             # input_ids
         {0: seq_dim},                             # cache_position
-        *_kv_dynamic_shapes(N_LM_LAYERS, "kv_seq_lm"),
+        tuple(_kv_dynamic_shapes(N_LM_LAYERS, "kv_seq_lm")),  # *flat_kv as tuple
     )
     return {"wrapper": wrapper, "example_inputs": example_inputs,
             "dynamic_shapes": dynamic_shapes}
@@ -288,11 +289,12 @@ def _spec_tts_lm(wrappers: dict) -> dict:
     seq_dim = _dim("seq")
     kv_dim  = _dim("kv_seq_tts")
 
+    # For variadic *flat_kv, KV shapes must be a tuple (matching example_inputs[3])
     dynamic_shapes = (
         {1: seq_dim},                             # lm_hidden_state
         {1: seq_dim},                             # tts_text_mask
         {0: seq_dim},                             # cache_position
-        *_kv_dynamic_shapes(N_TTS_LAYERS, "kv_seq_tts"),
+        tuple(_kv_dynamic_shapes(N_TTS_LAYERS, "kv_seq_tts")),  # *flat_kv as tuple
     )
     return {"wrapper": wrapper, "example_inputs": example_inputs,
             "dynamic_shapes": dynamic_shapes}
