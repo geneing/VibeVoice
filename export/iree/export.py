@@ -670,11 +670,13 @@ def export_component(
             # Target the host CPU to enable all available CPU features (AVX, etc.)
             # and silence the generic-CPU performance warning.
             extra_args.append("--iree-llvmcpu-target-cpu=host")
-        if backend_short == "vulkan":
+        if backend_short == "vulkan" and vulkan_target and vulkan_target.lower() != "none":
             # Override the default vp_android_baseline_2022 profile which only allows
             # 16 KB shared memory and no fp16 storage — far too conservative for real
             # GPUs. Specifying an explicit target (e.g. "adreno", "rdna3", "valhall4")
             # selects a profile with larger shared memory limits and fp16 support.
+            # Pass "none" (or omit) to use the conservative default profile, which
+            # is more compatible with non-Adreno Vulkan implementations (e.g. dzn).
             extra_args.append(f"--iree-vulkan-target={vulkan_target}")
 
         try:
@@ -687,12 +689,17 @@ def export_component(
             vmfb_path.write_bytes(vmfb_bytes)
             size_mb = vmfb_path.stat().st_size / (1024 * 1024)
             print(f"  [compile] {name} ✓  ({size_mb:.1f} MB)")
+            effective_vulkan_target = (
+                vulkan_target
+                if backend_short == "vulkan" and vulkan_target and vulkan_target.lower() != "none"
+                else None
+            )
             manifest_entry["backends"][backend_short] = {
                 "file":        vmfb_path.name,
                 "size_mb":     round(size_mb, 2),
                 "iree_target": iree_backend,
                 "fp16":        is_fp16_vulkan,
-                "vulkan_target": vulkan_target if backend_short == "vulkan" else None,
+                "vulkan_target": effective_vulkan_target,
             }
         except Exception as exc:
             warn = f"Compile to {iree_backend} failed for {name}: {exc!r}"
@@ -708,7 +715,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Export VibeVoice to IREE .vmfb")
     parser.add_argument(
         "--backends", nargs="+", choices=["cpu", "vulkan"], default=["cpu", "vulkan"],
-        help="Compile targets (default: both)",
+        help="Compile targets (default: cpu vulkan)",
     )
     parser.add_argument(
         "--component", choices=list(COMPONENT_SPECS), default=None,
@@ -719,11 +726,13 @@ def main() -> None:
         help="Compile Vulkan backend as FP16 (model cast to half() before export; default: True)",
     )
     parser.add_argument(
-        "--vulkan-target", default="adreno", dest="vulkan_target",
+        "--vulkan-target", default="valhall4", dest="vulkan_target",
         help=(
             "IREE Vulkan GPU target (--iree-vulkan-target). "
-            "Overrides the default vp_android_baseline_2022 profile (16 KB shared mem, no fp16). "
-            "Use 'adreno' for Qualcomm, 'valhall4' for Mali, 'rdna3' for AMD. (default: adreno)"
+            "Use 'adreno' for Qualcomm, 'valhall4' for Mali, 'rdna3' for AMD. "
+            "Use 'none' to omit the flag and use IREE's conservative default "
+            "vp_android_baseline_2022 profile — compatible with dzn and other "
+            "non-Adreno Vulkan implementations. (default: adreno)"
         ),
     )
     parser.add_argument(
@@ -764,13 +773,13 @@ def main() -> None:
     )
 
     manifest: dict[str, Any] = {
-        "method":       "iree",
-        "timestamp":    datetime.now(timezone.utc).isoformat(),
-        "model_path":   args.model_path,
-        "backends":     args.backends,
-        "fp16_vulkan":  args.fp16,
+        "method":        "iree",
+        "timestamp":     datetime.now(timezone.utc).isoformat(),
+        "model_path":    args.model_path,
+        "backends":      args.backends,
+        "fp16_vulkan":   args.fp16,
         "vulkan_target": args.vulkan_target,
-        "components":   {},
+        "components":    {},
     }
 
     for comp_name in components_to_export:

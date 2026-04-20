@@ -1,31 +1,23 @@
 {
   "method": "iree",
-  "timestamp": "2026-04-20T02:10:03.174174+00:00",
+  "timestamp": "2026-04-20T20:17:07.436910+00:00",
   "model_path": "/home/eingerman/Projects/TTS/VibeVoice/model",
   "backends": [
-    "cpu",
     "vulkan"
   ],
   "fp16_vulkan": true,
-  "vulkan_target": "adreno",
+  "vulkan_target": "valhall4",
   "components": {
     "text_lm": {
       "component": "text_lm",
       "dynamic_shapes": true,
       "backends": {
-        "cpu": {
-          "file": "text_lm_cpu.vmfb",
-          "size_mb": 746.94,
-          "iree_target": "llvm-cpu",
-          "fp16": false,
-          "vulkan_target": null
-        },
         "vulkan": {
           "file": "text_lm_vulkan_fp16.vmfb",
-          "size_mb": 373.63,
+          "size_mb": 373.64,
           "iree_target": "vulkan-spirv",
           "fp16": true,
-          "vulkan_target": "adreno"
+          "vulkan_target": "valhall4"
         }
       },
       "warnings": []
@@ -34,19 +26,12 @@
       "component": "tts_lm",
       "dynamic_shapes": true,
       "backends": {
-        "cpu": {
-          "file": "tts_lm_cpu.vmfb",
-          "size_mb": 1140.95,
-          "iree_target": "llvm-cpu",
-          "fp16": false,
-          "vulkan_target": null
-        },
         "vulkan": {
           "file": "tts_lm_vulkan_fp16.vmfb",
-          "size_mb": 570.9,
+          "size_mb": 570.91,
           "iree_target": "vulkan-spirv",
           "fp16": true,
-          "vulkan_target": "adreno"
+          "vulkan_target": "valhall4"
         }
       },
       "warnings": []
@@ -55,19 +40,12 @@
       "component": "acoustic_connector",
       "dynamic_shapes": false,
       "backends": {
-        "cpu": {
-          "file": "acoustic_connector_cpu.vmfb",
-          "size_mb": 3.31,
-          "iree_target": "llvm-cpu",
-          "fp16": false,
-          "vulkan_target": null
-        },
         "vulkan": {
           "file": "acoustic_connector_vulkan_fp16.vmfb",
           "size_mb": 1.67,
           "iree_target": "vulkan-spirv",
           "fp16": true,
-          "vulkan_target": "adreno"
+          "vulkan_target": "valhall4"
         }
       },
       "warnings": []
@@ -76,19 +54,12 @@
       "component": "diffusion_head",
       "dynamic_shapes": false,
       "backends": {
-        "cpu": {
-          "file": "diffusion_head_cpu.vmfb",
-          "size_mb": 160.6,
-          "iree_target": "llvm-cpu",
-          "fp16": false,
-          "vulkan_target": null
-        },
         "vulkan": {
           "file": "diffusion_head_vulkan_fp16.vmfb",
-          "size_mb": 80.43,
+          "size_mb": 80.39,
           "iree_target": "vulkan-spirv",
           "fp16": true,
-          "vulkan_target": "adreno"
+          "vulkan_target": "valhall4"
         }
       },
       "warnings": []
@@ -96,23 +67,10 @@
     "vocoder": {
       "component": "vocoder",
       "dynamic_shapes": true,
-      "backends": {
-        "cpu": {
-          "file": "vocoder_cpu.vmfb",
-          "size_mb": 1311.24,
-          "iree_target": "llvm-cpu",
-          "fp16": false,
-          "vulkan_target": null
-        },
-        "vulkan": {
-          "file": "vocoder_vulkan_fp16.vmfb",
-          "size_mb": 656.04,
-          "iree_target": "vulkan-spirv",
-          "fp16": true,
-          "vulkan_target": "adreno"
-        }
-      },
-      "warnings": []
+      "backends": {},
+      "warnings": [
+        "Compile to vulkan-spirv failed for vocoder: CompilerToolError('Error invoking IREE compiler tool iree-compile\\nError code: 1\\nDiagnostics:\\n/home/eingerman/Projects/TTS/VibeVoice/vibevoice/modular/modular_vibevoice_tokenizer.py:84:0: error: function \\'main$async_dispatch_2_reduction_Dx2048_f32\\' uses 131136 bytes of shared memory; exceeded the limit of 32768 bytes\\n/home/eingerman/Projects/TTS/VibeVoice/vibevoice/modular/modular_vibevoice_tokenizer.py:961:0: note: called from\\n/home/eingerman/Projects/TTS/VibeVoice/export/iree/wrappers.py:271:0: note: called from\\n/home/eingerman/Projects/TTS/VibeVoice/vibevoice/modular/modular_vibevoice_tokenizer.py:84:0: error: failed to run translation of source executable to target executable for backend #hal.executable.target<\"vulkan-spirv\", \"vulkan-spirv-fb\", {iree_codegen.target_info = #iree_gpu.target<arch = \"valhall4\", features = \"spirv:v1.6,cap:Shader\", wgp = <compute = fp32|fp16|int32|int16|int8, storage = b64|b32|b16|b8, subgroup = shuffle|arithmetic, dot = dp4xi8toi32, subgroup_size_choices = [16], max_workgroup_sizes = [512, 512, 512], max_thread_count_per_workgroup = 512, max_workgroup_memory_bytes = 32768, max_workgroup_counts = [65535, 65535, 65535]>>}>\\n/home/eingerman/Projects/TTS/VibeVoice/vibevoice/modular/modular_vibevoice_tokenizer.py:961:0: note: called from\\n/home/eingerman/Projects/TTS/VibeVoice/export/iree/wrappers.py:271:0: note: called from\\n/home/eingerman/Projects/TTS/VibeVoice/vibevoice/modular/modular_vibevoice_tokenizer.py:84:0: error: function \\'main$async_dispatch_4_reduction_Dx2048_f32\\' uses 131136 bytes of shared memory; exceeded the limit of 32768 bytes\\n/home/eingerman/Projects/TTS/VibeVoice/vibevoice/modular/modular_vibevoice_tokenizer.py:961:0: note: called from\\n/home/eingerman/Projects/TTS/VibeVoice/export/iree/wrappers.py:271:0: note: called from\\n/home/eingerman/Projects/TTS/VibeVoice/vibevoice/modular/modular_vibevoice_tokenizer.py:84:0: error: failed to run translation of source executable to target executable for backend #hal.executable.target<\"vulkan-spirv\", \"vulkan-spirv-fb\", {iree_codegen.target_info = #iree_gpu.target<arch = \"valhall4\", features = \"spirv:v1.6,cap:Shader\", wgp = <compute = fp32|fp16|int32|int16|int8, storage = b64|b32|b16|b8, subgroup = shuffle|arithmetic, dot = dp4xi8toi32, subgroup_size_choices = [16], max_workgroup_sizes = [512, 512, 512], max_thread_count_per_workgroup = 512, max_workgroup_memory_bytes = 32768, max_workgroup_counts = [65535, 65535, 65535]>>}>\\n/home/eingerman/Projects/TTS/VibeVoice/vibevoice/modular/modular_vibevoice_tokenizer.py:961:0: note: called from\\n/home/eingerman/Projects/TTS/VibeVoice/export/iree/wrappers.py:271:0: note: called from\\n\\n\\nInvoked with:\\n iree-compile /home/eingerman/Projects/TTS/VibeVoice/export/iree/.venv/lib/python3.12/site-packages/iree/compiler/tools/../_mlir_libs/iree-compile - --iree-input-type=torch --iree-vm-bytecode-module-output-format=flatbuffer-binary --iree-hal-target-backends=vulkan-spirv --mlir-print-debuginfo --mlir-print-op-on-diagnostic=false --iree-vulkan-target=valhall4\\n\\nNeed more information? Set IREE_SAVE_TEMPS=/some/dir in your environment to save all artifacts and reproducers.\\n')"
+      ]
     }
   }
 }

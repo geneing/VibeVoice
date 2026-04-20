@@ -123,12 +123,11 @@ IREE_DRIVER_MAP = {
 }
 
 
-def _load_vmfb(path: str | Path, driver: str):
-    """Load a .vmfb and return a callable module."""
+def _load_vmfb(path: str | Path, config):
+    """Load a .vmfb into an existing IREE config and return a callable module."""
     import iree.runtime as ireert
     with open(str(path), "rb") as f:
         bytecode = f.read()
-    config = ireert.Config(driver)
     return ireert.load_vm_module(
         ireert.VmModule.copy_buffer(config.vm_instance, bytecode),
         config,
@@ -232,12 +231,23 @@ class IREEVibeVoiceInference:
         suffix = f"{backend}_fp16" if is_fp16_vulkan else backend
         self._fp16 = is_fp16_vulkan   # used to cast inputs before IREE calls
 
+        # The vocoder (HiFiGAN) contains 2048-channel layer-norm reductions that
+        # require ~128 KB of shared memory — more than any Vulkan GPU preset
+        # provides.  Run it on CPU regardless of the chosen backend.
+        # The vocoder is called once at the end of generation, so CPU latency
+        # is acceptable.
+        self._vocoder_fp16 = False  # vocoder always runs fp32 on CPU
+
         print(f"Loading IREE components (backend={backend}, fp16={is_fp16_vulkan}) …")
-        self._text_lm   = _load_vmfb(d / f"text_lm_{suffix}.vmfb",            driver)
-        self._tts_lm    = _load_vmfb(d / f"tts_lm_{suffix}.vmfb",             driver)
-        self._connector = _load_vmfb(d / f"acoustic_connector_{suffix}.vmfb",  driver)
-        self._diff_head = _load_vmfb(d / f"diffusion_head_{suffix}.vmfb",      driver)
-        self._vocoder   = _load_vmfb(d / f"vocoder_{suffix}.vmfb",             driver)
+        import iree.runtime as ireert
+        config = ireert.Config(driver)  # one device shared across all modules
+        self._text_lm   = _load_vmfb(d / f"text_lm_{suffix}.vmfb",            config)
+        self._tts_lm    = _load_vmfb(d / f"tts_lm_{suffix}.vmfb",             config)
+        self._connector = _load_vmfb(d / f"acoustic_connector_{suffix}.vmfb",  config)
+        self._diff_head = _load_vmfb(d / f"diffusion_head_{suffix}.vmfb",      config)
+        # Vocoder always on CPU (see note above).
+        cpu_config = ireert.Config("local-task") if backend != "cpu" else config
+        self._vocoder   = _load_vmfb(d / "vocoder_cpu.vmfb", cpu_config)
         print("  All components loaded.")
 
         # Load DPM betas from nenad102_onnx (pre-computed)
@@ -248,6 +258,14 @@ class IREEVibeVoiceInference:
             # Cosine schedule fallback (matches DPMSolverMultistepScheduler defaults)
             betas = self._cosine_betas(1000)
         self._sigmas = _compute_sigmas(DDPM_TIMESTEPS, betas)
+
+        # Load processor once; local_files_only prevents hub network calls.
+        from vibevoice.processor.vibevoice_streaming_processor import (
+            VibeVoiceStreamingProcessor,
+        )
+        self._proc = VibeVoiceStreamingProcessor.from_pretrained(
+            str(MODEL_PATH), local_files_only=True
+        )
 
     @staticmethod
     def _cosine_betas(n: int, max_beta: float = 0.999) -> np.ndarray:
@@ -361,7 +379,7 @@ class IREEVibeVoiceInference:
         """
         latent_seq = np.concatenate(all_latents, axis=0)           # (N, 64)
         latent_seq = latent_seq[np.newaxis, :, :]                   # (1, N, 64)
-        outs = _call(self._vocoder, _cast_fp(latent_seq, self._fp16))
+        outs = _call(self._vocoder, _cast_fp(latent_seq, self._vocoder_fp16))
         waveform = outs[0].flatten().astype(np.float32)
         return waveform
 
@@ -413,13 +431,8 @@ class IREEVibeVoiceInference:
         Returns int64 numpy array of shape (1, N_tokens).
         """
         import torch
-        from vibevoice.processor.vibevoice_streaming_processor import (
-            VibeVoiceStreamingProcessor,
-        )
-        model_path = str(MODEL_PATH)
-        proc = VibeVoiceStreamingProcessor.from_pretrained(model_path)
         preset = torch.load(str(voice_path), map_location="cpu", weights_only=False)
-        inputs = proc.process_input_with_cached_prompt(
+        inputs = self._proc.process_input_with_cached_prompt(
             text=text,
             cached_prompt=preset,
             padding=True,
@@ -448,17 +461,12 @@ class IREEVibeVoiceInference:
         Returns float32 numpy waveform at SAMPLE_RATE Hz.
         """
         import torch
-        # Re-use the processor only for tokenisation; no PyTorch inference.
-        from vibevoice.processor.vibevoice_streaming_processor import (
-            VibeVoiceStreamingProcessor,
-        )
 
         voice = self._load_voice(voice_path)
 
-        # Tokenise
-        proc = VibeVoiceStreamingProcessor.from_pretrained(str(MODEL_PATH))
+        # Tokenise using the pre-loaded processor (no hub network calls).
         preset = torch.load(str(voice_path), map_location="cpu", weights_only=False)
-        inputs = proc.process_input_with_cached_prompt(
+        inputs = self._proc.process_input_with_cached_prompt(
             text=text,
             cached_prompt=preset,
             padding=True,
@@ -469,7 +477,7 @@ class IREEVibeVoiceInference:
         total_tokens = tts_text_ids.shape[1]
 
         if verbose:
-            print(f"  {total_tokens} text tokens")
+            print(f"  {total_tokens} text tokens (max_speech_tokens={max_speech_tokens})")
 
         # Initialise running KV state from voice preset
         lm_keys      = [k.copy() for k in voice["lm_keys"]]
@@ -569,14 +577,15 @@ class IREEVibeVoiceInference:
 # ── Convenience function (mirrors demo/realtime_inference.py interface) ───────
 
 def generate_speech(
-    text:            str,
-    voice_path:      str | Path,
-    output_path:     str | Path,
-    vmfb_dir:        str | Path = EXPORT_DIR,
-    backend:         str        = "cpu",
-    fp16:            bool       = True,
-    cfg_scale:       float      = CFG_SCALE_DEF,
-    verbose:         bool       = True,
+    text:              str,
+    voice_path:        str | Path,
+    output_path:       str | Path,
+    vmfb_dir:          str | Path = EXPORT_DIR,
+    backend:           str        = "cpu",
+    fp16:              bool       = True,
+    cfg_scale:         float      = CFG_SCALE_DEF,
+    max_speech_tokens: int        = 512,
+    verbose:           bool       = True,
 ) -> str:
     """
     Generate speech using IREE .vmfb components and save to a WAV file.
@@ -606,6 +615,7 @@ def generate_speech(
         text=text,
         voice_path=voice_path,
         cfg_scale=cfg_scale,
+        max_speech_tokens=max_speech_tokens,
         verbose=verbose,
     )
     elapsed = time.time() - start
@@ -644,6 +654,10 @@ def main() -> None:
         help="Load *_vulkan_fp16.vmfb files and cast float inputs to float16 (default: True)",
     )
     parser.add_argument("--cfg_scale", type=float, default=CFG_SCALE_DEF)
+    parser.add_argument(
+        "--max_speech_tokens", type=int, default=512,
+        help="Maximum speech tokens to generate (safety stop). Default: 512.",
+    )
     args = parser.parse_args()
 
     generate_speech(
@@ -654,6 +668,7 @@ def main() -> None:
         backend=args.backend,
         fp16=args.fp16,
         cfg_scale=args.cfg_scale,
+        max_speech_tokens=args.max_speech_tokens,
         verbose=True,
     )
 
