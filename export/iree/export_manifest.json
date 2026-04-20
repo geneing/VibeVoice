@@ -1,10 +1,13 @@
 {
   "method": "iree",
-  "timestamp": "2026-04-17T18:50:00.040812+00:00",
+  "timestamp": "2026-04-20T02:10:03.174174+00:00",
   "model_path": "/home/eingerman/Projects/TTS/VibeVoice/model",
   "backends": [
-    "cpu"
+    "cpu",
+    "vulkan"
   ],
+  "fp16_vulkan": true,
+  "vulkan_target": "adreno",
   "components": {
     "text_lm": {
       "component": "text_lm",
@@ -12,8 +15,17 @@
       "backends": {
         "cpu": {
           "file": "text_lm_cpu.vmfb",
-          "size_mb": 746.95,
-          "iree_target": "llvm-cpu"
+          "size_mb": 746.94,
+          "iree_target": "llvm-cpu",
+          "fp16": false,
+          "vulkan_target": null
+        },
+        "vulkan": {
+          "file": "text_lm_vulkan_fp16.vmfb",
+          "size_mb": 373.63,
+          "iree_target": "vulkan-spirv",
+          "fp16": true,
+          "vulkan_target": "adreno"
         }
       },
       "warnings": []
@@ -24,8 +36,17 @@
       "backends": {
         "cpu": {
           "file": "tts_lm_cpu.vmfb",
-          "size_mb": 1140.92,
-          "iree_target": "llvm-cpu"
+          "size_mb": 1140.95,
+          "iree_target": "llvm-cpu",
+          "fp16": false,
+          "vulkan_target": null
+        },
+        "vulkan": {
+          "file": "tts_lm_vulkan_fp16.vmfb",
+          "size_mb": 570.9,
+          "iree_target": "vulkan-spirv",
+          "fp16": true,
+          "vulkan_target": "adreno"
         }
       },
       "warnings": []
@@ -36,8 +57,17 @@
       "backends": {
         "cpu": {
           "file": "acoustic_connector_cpu.vmfb",
-          "size_mb": 3.3,
-          "iree_target": "llvm-cpu"
+          "size_mb": 3.31,
+          "iree_target": "llvm-cpu",
+          "fp16": false,
+          "vulkan_target": null
+        },
+        "vulkan": {
+          "file": "acoustic_connector_vulkan_fp16.vmfb",
+          "size_mb": 1.67,
+          "iree_target": "vulkan-spirv",
+          "fp16": true,
+          "vulkan_target": "adreno"
         }
       },
       "warnings": []
@@ -49,19 +79,37 @@
         "cpu": {
           "file": "diffusion_head_cpu.vmfb",
           "size_mb": 160.6,
-          "iree_target": "llvm-cpu"
+          "iree_target": "llvm-cpu",
+          "fp16": false,
+          "vulkan_target": null
+        },
+        "vulkan": {
+          "file": "diffusion_head_vulkan_fp16.vmfb",
+          "size_mb": 80.43,
+          "iree_target": "vulkan-spirv",
+          "fp16": true,
+          "vulkan_target": "adreno"
         }
       },
       "warnings": []
     },
     "vocoder": {
       "component": "vocoder",
-      "dynamic_shapes": false,
+      "dynamic_shapes": true,
       "backends": {
         "cpu": {
           "file": "vocoder_cpu.vmfb",
-          "size_mb": 1311.2,
-          "iree_target": "llvm-cpu"
+          "size_mb": 1311.24,
+          "iree_target": "llvm-cpu",
+          "fp16": false,
+          "vulkan_target": null
+        },
+        "vulkan": {
+          "file": "vocoder_vulkan_fp16.vmfb",
+          "size_mb": 656.04,
+          "iree_target": "vulkan-spirv",
+          "fp16": true,
+          "vulkan_target": "adreno"
         }
       },
       "warnings": []

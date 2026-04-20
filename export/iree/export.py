@@ -149,6 +149,27 @@ def _patch_create_causal_mask():
             qm.create_causal_mask = orig_qm
 
 
+@contextmanager
+def _patch_math_ceil():
+    """
+    Replace math.ceil with int() during torch.export.
+
+    Transposed-conv output-size helpers call math.ceil(float_expr) where
+    float_expr is always an integer-valued float (stride-1 divisions of integer
+    symbolic dims).  math.ceil produces call_function nodes that iree-turbine's
+    FxImporter cannot lower.  Substituting int() — which is semantically
+    identical for integer-valued floats — either inlines the conversion or
+    produces a more-lowerable node type.
+    """
+    import math
+    orig = math.ceil
+    math.ceil = int  # int(x) == ceil(x) for all integer-valued x
+    try:
+        yield
+    finally:
+        math.ceil = orig
+
+
 def _preload_torch_decompositions() -> None:
     """
     Force-load PyTorch's op decomposition table before torch.export.
@@ -197,6 +218,136 @@ def _remove_lazy_load_nodes(exported_prog: torch.export.ExportedProgram) -> torc
 
     print(f"  [graph-patch] Removed {len(to_erase)} lazy_load_decompositions node(s).")
     exported_prog.graph_module.recompile()
+    return exported_prog
+
+
+def _replace_ceil_with_input(exported_prog: torch.export.ExportedProgram) -> torch.export.ExportedProgram:
+    """
+    Replace ``math.ceil(x)`` call_function nodes with integer-typed equivalents.
+
+    Context
+    -------
+    The vocoder's conv_transpose1d output-size helpers emit ``math.ceil(N)``
+    nodes when the input sequence length is symbolic.  All such expressions
+    have the form::
+
+        ceil(add(truediv(symint_expr, int_stride), float_const))
+
+    or the degenerate form::
+
+        ceil(truediv(symint_expr, int_stride))   (float_const == 0)
+
+    Because the vocoder upsamples by exact integer multiples (HiFiGAN-style,
+    strides divide the sequence length evenly), the expression under ceil is
+    always integer-valued.  We therefore replace it with the equivalent integer
+    arithmetic::
+
+        floordiv(symint_expr, int_stride) + round(float_const)
+
+    This removes the ``truediv``/``add.float`` chain that iree-turbine's
+    FxImporter cannot lower, while producing the identical integer result.
+
+    The replacement is also valid for chained ceilings (ceil node feeds into
+    the numerator of a later truediv) because we iterate in topological order
+    and each replaced node is already an integer-typed FX node before the next
+    iteration processes its dependants.
+    """
+    import math
+    import operator
+
+    graph = exported_prog.graph_module.graph
+    replaced = 0
+
+    for node in list(graph.nodes):
+        if not (node.op == "call_function" and node.target is math.ceil):
+            continue
+
+        float_arg = node.args[0]
+        if not isinstance(float_arg, torch.fx.Node):
+            continue
+
+        # ── Case 1: ceil(add(truediv(X, stride), float_const)) ──────────────
+        if float_arg.op == "call_function" and float_arg.target is operator.add:
+            truediv_node = None
+            float_const: float | None = None
+            for a in float_arg.args:
+                if (isinstance(a, torch.fx.Node)
+                        and a.op == "call_function"
+                        and a.target is operator.truediv):
+                    truediv_node = a
+                elif isinstance(a, (int, float)):
+                    float_const = float(a)
+            if truediv_node is None:
+                continue
+            if float_const is None:
+                float_const = 0.0
+            if len(truediv_node.args) < 2 or not isinstance(truediv_node.args[1], int):
+                continue
+            stride: int = truediv_node.args[1]
+            numerator = truediv_node.args[0]
+
+        # ── Case 2: ceil(truediv(X, stride)) ────────────────────────────────
+        elif float_arg.op == "call_function" and float_arg.target is operator.truediv:
+            if len(float_arg.args) < 2 or not isinstance(float_arg.args[1], int):
+                continue
+            truediv_node = float_arg
+            stride = float_arg.args[1]
+            numerator = float_arg.args[0]
+            float_const = 0.0
+        else:
+            continue
+
+        int_const = round(float_const)  # 1.0 → 1, 0.0 → 0, -1.0 → -1
+
+        # Capture the ceil node's symbolic value BEFORE we erase it.
+        # We'll propagate it (and derived values) to the new nodes so that
+        # iree-turbine's FxImporter sees is_symbolic(node.meta["val"]) == True
+        # and routes the new nodes through _import_symbolic_torch_op.
+        ceil_sym_val = node.meta.get("val")   # torch.SymInt or None
+
+        # Build: floordiv(numerator, stride) + int_const
+        with graph.inserting_before(node):
+            if stride == 1:
+                fd = numerator
+            else:
+                fd = graph.call_function(operator.floordiv, args=(numerator, stride))
+                # Propagate SymInt val for the floordiv node
+                if ceil_sym_val is not None:
+                    try:
+                        fd.meta["val"] = ceil_sym_val - int_const  # type: ignore[operator]
+                    except Exception:
+                        pass
+
+            if int_const != 0:
+                int_result: torch.fx.Node = graph.call_function(
+                    operator.add, args=(fd, int_const))
+                if ceil_sym_val is not None:
+                    int_result.meta["val"] = ceil_sym_val
+            else:
+                int_result = fd  # type: ignore[assignment]
+                if ceil_sym_val is not None and int_result is not numerator:
+                    int_result.meta["val"] = ceil_sym_val
+
+        node.replace_all_uses_with(int_result)
+        graph.erase_node(node)
+        replaced += 1
+
+    if replaced:
+        # Clean up now-dead float intermediary nodes (truediv / add.float / sub)
+        changed = True
+        while changed:
+            changed = False
+            for n in list(graph.nodes):
+                if (n.op == "call_function"
+                        and not n.users
+                        and n.target in (operator.truediv, operator.add, operator.sub)):
+                    try:
+                        graph.erase_node(n)
+                        changed = True
+                    except Exception:
+                        pass
+        print(f"  [graph-patch] Replaced {replaced} math.ceil node(s) with integer floordiv.")
+        exported_prog.graph_module.recompile()
     return exported_prog
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -276,37 +427,34 @@ def _spec_text_lm(wrappers: dict) -> dict:
 
 def _spec_tts_lm(wrappers: dict) -> dict:
     wrapper = wrappers["tts_lm"]
-    # seq=1: TTSLMWrapper is always called one token at a time in the decode loop.
-    # Making seq dynamic causes constraint violations because the model specialises
-    # it to 1 internally.  Only kv_seq_tts (the growing KV cache) needs to be dynamic.
-    seq = 1
+    # Use example seq=5 (TEXT_WINDOW size) to capture both the text-window and
+    # speech-token (seq=1) call sites.  Both seq and kv_seq are marked DYNAMIC
+    # so torch.export cannot specialise either, avoiding constraint violations
+    # from Qwen2's GQA repeat_kv symbolic guard.
+    seq = 5
     kv_seq = 128
 
     example_inputs = (
-        torch.zeros(1, seq, HIDDEN_SIZE),                   # lm_hidden_state
-        torch.zeros(1, seq, dtype=torch.long),              # tts_text_mask
-        torch.arange(kv_seq, kv_seq + seq, dtype=torch.long),  # cache_position
+        torch.zeros(1, seq, HIDDEN_SIZE),                        # lm_hidden_state
+        torch.zeros(1, seq, dtype=torch.long),                   # tts_text_mask
+        torch.arange(kv_seq, kv_seq + seq, dtype=torch.long),   # cache_position
         *_kv_example(N_TTS_LAYERS, kv_seq),
     )
 
-    kv_dim  = _dim("kv_seq_tts", min=1)
-
-    # seq is static (=1); only the KV cache sequence length is dynamic.
-    # kv_seq_tts uses Dim.DYNAMIC to bypass the symbolic guard generated by
-    # Qwen2's GQA repeat_kv: min(HEAD_DIM*(1+kv_seq), 7*HEAD_DIM*(1+kv_seq))
-    # which torch.export cannot prove constant for all kv_seq values.
-    kv_dyn = torch.export.Dim.DYNAMIC
+    # Both seq and kv_seq are dynamic; Dim.DYNAMIC bypasses torch.export
+    # constraint checking so symbolic guards don't cause export failures.
+    seq_dyn = torch.export.Dim.DYNAMIC
+    kv_dyn  = torch.export.Dim.DYNAMIC
     kv_shapes: list[dict] = []
     for _ in range(N_TTS_LAYERS):
         kv_shapes.append({2: kv_dyn})  # key tensor
         kv_shapes.append({2: kv_dyn})  # value tensor
 
-    # seq is static (=1); only the KV cache sequence length is dynamic.
     dynamic_shapes = (
-        None,                                             # lm_hidden_state (static)
-        None,                                             # tts_text_mask   (static)
-        None,                                             # cache_position  (static)
-        tuple(kv_shapes),  # *flat_kv as tuple
+        {1: seq_dyn},                                         # lm_hidden_state
+        {1: seq_dyn},                                         # tts_text_mask
+        {0: seq_dyn},                                         # cache_position
+        tuple(kv_shapes),                                     # *flat_kv as tuple
     )
     return {"wrapper": wrapper, "example_inputs": example_inputs,
             "dynamic_shapes": dynamic_shapes}
@@ -337,12 +485,13 @@ def _spec_diffusion_head(wrappers: dict) -> dict:
 
 def _spec_vocoder(wrappers: dict) -> dict:
     wrapper = wrappers["vocoder"]
-    # Vocoder uses transposed convolutions whose output-size formulas contain
-    # `ceil()` on symbolic expressions.  iree-turbine's FxImporter cannot lower
-    # symbolic `ceil`, so the vocoder must be exported statically.
-    # The example uses 32 frames (typical for a short speech window).
+    # Transposed-conv output-size helpers emit math.ceil(N) nodes when the input
+    # length is symbolic.  Dim.DYNAMIC bypasses torch.export constraint checking;
+    # _replace_ceil_with_input() then removes the ceil nodes before iree-turbine
+    # sees them (ceil(N)==N for all integer N).
     example_inputs = (torch.zeros(1, 32, LATENT_DIM),)
-    dynamic_shapes = None
+    frames_dim = torch.export.Dim.DYNAMIC
+    dynamic_shapes = ({1: frames_dim},)
     return {"wrapper": wrapper, "example_inputs": example_inputs,
             "dynamic_shapes": dynamic_shapes}
 
@@ -363,109 +512,187 @@ BACKEND_MAP = {
 
 # ── Core export function ──────────────────────────────────────────────────────
 
-def export_component(
+def _torch_export_to_mlir_bytes(
     name: str,
-    spec: dict,
-    backends: list[str],
-    out_dir: Path,
-) -> dict[str, Any]:
+    wrapper: torch.nn.Module,
+    example_inputs: tuple,
+    dynamic_shapes,
+    warnings_out: list[str],
+    label: str = "",
+) -> bytes | None:
     """
-    Export one component → one .vmfb per backend.
+    Run torch.export → graph patches → iree.turbine.aot.export → MLIR bytes.
 
-    Returns a manifest entry dict.
+    Returns serialised MLIR bytecode, or None if the export failed (error is
+    appended to warnings_out and printed to stderr).
     """
+    import io as _io
     import iree.turbine.aot as aot
 
-    wrapper        = spec["wrapper"]
-    example_inputs = spec["example_inputs"]
-    dynamic_shapes = spec.get("dynamic_shapes")
-
-    wrapper.eval()
-    with torch.no_grad():
-        pass  # ensure eval mode
-
-    manifest_entry: dict[str, Any] = {
-        "component":     name,
-        "dynamic_shapes": dynamic_shapes is not None,
-        "backends":      {},
-        "warnings":      [],
-    }
-
-    # 1. torch.export  ─────────────────────────────────────────────────────────
+    tag = f" ({label})" if label else ""
     exported_prog = None
-    dynamic_export_succeeded = False
 
-    # Pre-load decompositions to prevent lazy_load_decompositions nodes in graph.
     _preload_torch_decompositions()
 
-    # Patch Qwen2 RoPE and create_causal_mask for the duration of torch.export
-    # to eliminate HOPs that iree-turbine cannot lower.
     with _patch_qwen2_rope(), _patch_create_causal_mask():
         if dynamic_shapes is not None:
             try:
-                print(f"  [torch.export] {name} (dynamic shapes) …")
+                print(f"  [torch.export] {name}{tag} (dynamic shapes) …")
                 exported_prog = torch.export.export(
                     wrapper,
                     example_inputs,
                     dynamic_shapes=dynamic_shapes,
                     strict=False,
                 )
-                dynamic_export_succeeded = True
-                print(f"  [torch.export] {name} ✓ (dynamic)")
+                print(f"  [torch.export] {name}{tag} ✓ (dynamic)")
             except Exception as exc:
-                warn = (f"torch.export with dynamic_shapes failed for {name}: {exc!r}. "
-                        "Falling back to static shapes from example_inputs.")
+                warn = (f"torch.export with dynamic_shapes failed for {name}{tag}: {exc!r}. "
+                        "Falling back to static shapes.")
                 print(f"  WARNING: {warn}", file=sys.stderr)
-                manifest_entry["warnings"].append(warn)
+                warnings_out.append(warn)
 
         if exported_prog is None:
-            # Static fallback
             try:
-                print(f"  [torch.export] {name} (static shapes, fallback) …")
+                print(f"  [torch.export] {name}{tag} (static shapes) …")
                 exported_prog = torch.export.export(
                     wrapper,
                     example_inputs,
                     strict=False,
                 )
-                print(f"  [torch.export] {name} ✓ (static)")
+                print(f"  [torch.export] {name}{tag} ✓ (static)")
             except Exception as exc:
-                err = f"torch.export failed entirely for {name}: {exc}"
+                err = f"torch.export failed entirely for {name}{tag}: {exc}"
                 print(f"  ERROR: {err}", file=sys.stderr)
                 traceback.print_exc()
-                manifest_entry["error"] = err
-                return manifest_entry
+                warnings_out.append(err)
+                return None
 
-    # 1b. Post-process: remove lazy_load_decompositions nodes that iree-turbine
-    #     cannot lower.  These are pure side-effect calls with no return value.
     exported_prog = _remove_lazy_load_nodes(exported_prog)
+    exported_prog = _replace_ceil_with_input(exported_prog)
 
-    # 2. iree-turbine AOT  ─────────────────────────────────────────────────────
     try:
-        print(f"  [iree.turbine.aot.export] {name} …")
+        print(f"  [iree.turbine.aot.export] {name}{tag} …")
         iree_output = aot.export(exported_prog)
-        print(f"  [iree.turbine.aot.export] {name} ✓")
+        print(f"  [iree.turbine.aot.export] {name}{tag} ✓")
     except Exception as exc:
-        err = f"iree.turbine.aot.export failed for {name}: {exc}"
+        err = f"iree.turbine.aot.export failed for {name}{tag}: {exc}"
         print(f"  ERROR: {err}", file=sys.stderr)
         traceback.print_exc()
-        manifest_entry["error"] = err
-        return manifest_entry
+        warnings_out.append(err)
+        return None
 
-    # 3. Compile to each backend  ──────────────────────────────────────────────
+    buf = _io.BytesIO()
+    iree_output.mlir_module.write_bytecode(buf)
+    return buf.getvalue()
+
+
+def export_component(
+    name: str,
+    spec: dict,
+    backends: list[str],
+    out_dir: Path,
+    fp16: bool = True,
+    vulkan_target: str = "adreno",
+) -> dict[str, Any]:
+    """
+    Export one component → one .vmfb per backend.
+
+    When fp16=True the Vulkan backend is compiled from a float16 model export
+    (wrapper cast to .half() before torch.export) so that all constants and ops
+    are natively f16 in the MLIR — avoiding the broken --iree-input-demote-f32-to-f16
+    pass that produces arith.constant type-verification failures.  The CPU
+    backend always uses a float32 export.
+
+    Returns a manifest entry dict.
+    """
+    import iree.compiler as iree_compiler
+
+    wrapper        = spec["wrapper"]
+    example_inputs = spec["example_inputs"]
+    dynamic_shapes = spec.get("dynamic_shapes")
+
+    wrapper.eval()
+
+    manifest_entry: dict[str, Any] = {
+        "component":      name,
+        "dynamic_shapes": dynamic_shapes is not None,
+        "backends":       {},
+        "warnings":       [],
+    }
+
+    # Partition backends: cpu (and vulkan without fp16) use f32; vulkan+fp16 uses f16.
+    f32_backends = [b for b in backends if not (b == "vulkan" and fp16)]
+    f16_backends = [b for b in backends if b == "vulkan" and fp16]
+
+    # ── Build f32 MLIR (for CPU / non-fp16 Vulkan) ────────────────────────────
+    mlir_bytes_f32: bytes | None = None
+    if f32_backends:
+        mlir_bytes_f32 = _torch_export_to_mlir_bytes(
+            name, wrapper, example_inputs, dynamic_shapes,
+            manifest_entry["warnings"], label="f32",
+        )
+        if mlir_bytes_f32 is None:
+            manifest_entry["error"] = f"f32 export failed for {name}"
+            if not f16_backends:
+                return manifest_entry
+
+    # ── Build f16 MLIR (for Vulkan fp16) ──────────────────────────────────────
+    mlir_bytes_f16: bytes | None = None
+    if f16_backends:
+        # Deep-copy the wrapper so we don't mutate the shared model weights.
+        wrapper_f16 = copy.deepcopy(wrapper).half()
+        wrapper_f16.eval()
+        # Cast all floating-point example inputs to f16; leave integer tensors intact.
+        example_inputs_f16 = tuple(
+            t.half() if isinstance(t, torch.Tensor) and t.is_floating_point() else t
+            for t in example_inputs
+        )
+        mlir_bytes_f16 = _torch_export_to_mlir_bytes(
+            name, wrapper_f16, example_inputs_f16, dynamic_shapes,
+            manifest_entry["warnings"], label="f16",
+        )
+        if mlir_bytes_f16 is None:
+            manifest_entry["warnings"].append(f"f16 export failed for {name}; skipping Vulkan fp16.")
+
+    # ── Compile each backend ───────────────────────────────────────────────────
     for backend_short, iree_backend in [(b, BACKEND_MAP[b]) for b in backends]:
-        vmfb_path = out_dir / f"{name}_{backend_short}.vmfb"
+        is_fp16_vulkan = backend_short == "vulkan" and fp16
+        mlir_bytes = mlir_bytes_f16 if is_fp16_vulkan else mlir_bytes_f32
+        if mlir_bytes is None:
+            continue  # export already failed; warning recorded above
+
+        vmfb_suffix = f"{backend_short}_fp16" if is_fp16_vulkan else backend_short
+        vmfb_path   = out_dir / f"{name}_{vmfb_suffix}.vmfb"
         print(f"  [compile] {name} → {iree_backend} ({vmfb_path.name}) …")
+
+        extra_args: list[str] = []
+        if backend_short == "cpu":
+            # Target the host CPU to enable all available CPU features (AVX, etc.)
+            # and silence the generic-CPU performance warning.
+            extra_args.append("--iree-llvmcpu-target-cpu=host")
+        if backend_short == "vulkan":
+            # Override the default vp_android_baseline_2022 profile which only allows
+            # 16 KB shared memory and no fp16 storage — far too conservative for real
+            # GPUs. Specifying an explicit target (e.g. "adreno", "rdna3", "valhall4")
+            # selects a profile with larger shared memory limits and fp16 support.
+            extra_args.append(f"--iree-vulkan-target={vulkan_target}")
+
         try:
-            iree_output.compile(
-                save_to=str(vmfb_path),
+            vmfb_bytes = iree_compiler.compile_str(
+                mlir_bytes,
                 target_backends=[iree_backend],
+                input_type="torch",
+                extra_args=extra_args,
             )
+            vmfb_path.write_bytes(vmfb_bytes)
             size_mb = vmfb_path.stat().st_size / (1024 * 1024)
             print(f"  [compile] {name} ✓  ({size_mb:.1f} MB)")
             manifest_entry["backends"][backend_short] = {
-                "file": vmfb_path.name,
-                "size_mb": round(size_mb, 2),
+                "file":        vmfb_path.name,
+                "size_mb":     round(size_mb, 2),
                 "iree_target": iree_backend,
+                "fp16":        is_fp16_vulkan,
+                "vulkan_target": vulkan_target if backend_short == "vulkan" else None,
             }
         except Exception as exc:
             warn = f"Compile to {iree_backend} failed for {name}: {exc!r}"
@@ -486,6 +713,18 @@ def main() -> None:
     parser.add_argument(
         "--component", choices=list(COMPONENT_SPECS), default=None,
         help="Export a single component only (default: all)",
+    )
+    parser.add_argument(
+        "--fp16", action=argparse.BooleanOptionalAction, default=True,
+        help="Compile Vulkan backend as FP16 (model cast to half() before export; default: True)",
+    )
+    parser.add_argument(
+        "--vulkan-target", default="adreno", dest="vulkan_target",
+        help=(
+            "IREE Vulkan GPU target (--iree-vulkan-target). "
+            "Overrides the default vp_android_baseline_2022 profile (16 KB shared mem, no fp16). "
+            "Use 'adreno' for Qualcomm, 'valhall4' for Mali, 'rdna3' for AMD. (default: adreno)"
+        ),
     )
     parser.add_argument(
         "--model_path", default=str(MODEL_PATH),
@@ -525,18 +764,23 @@ def main() -> None:
     )
 
     manifest: dict[str, Any] = {
-        "method":    "iree",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "model_path": args.model_path,
-        "backends":  args.backends,
-        "components": {},
+        "method":       "iree",
+        "timestamp":    datetime.now(timezone.utc).isoformat(),
+        "model_path":   args.model_path,
+        "backends":     args.backends,
+        "fp16_vulkan":  args.fp16,
+        "vulkan_target": args.vulkan_target,
+        "components":   {},
     }
 
     for comp_name in components_to_export:
         print(f"\n{'─'*60}")
         print(f"Exporting: {comp_name}")
         spec = COMPONENT_SPECS[comp_name](wrappers)
-        entry = export_component(comp_name, spec, args.backends, EXPORT_DIR)
+        entry = export_component(
+            comp_name, spec, args.backends, EXPORT_DIR,
+            fp16=args.fp16, vulkan_target=args.vulkan_target,
+        )
         manifest["components"][comp_name] = entry
 
     # ── Write manifest ─────────────────────────────────────────────────────────

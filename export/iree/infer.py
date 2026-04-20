@@ -7,7 +7,7 @@ All five components are called via IREE runtime; no PyTorch at inference time.
 Windowing, EOS detection, DPM-Solver++ scheduling, and CFG are in Python/numpy.
 
 Usage:
-    uv run python export/iree/infer.py \
+    uv run python infer.py \
         --text "Hello world" \
         --voice ../../demo/voices/streaming_model/en-Carter_man.pt \
         --output output_iree.wav \
@@ -29,6 +29,7 @@ import numpy as np
 
 REPO_ROOT  = Path(__file__).resolve().parents[2]
 EXPORT_DIR = Path(__file__).parent
+MODEL_PATH = REPO_ROOT / "model"
 
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -142,13 +143,26 @@ def _to_np(t) -> np.ndarray:
     return np.asarray(t, dtype=np.float32)
 
 
-def _call(module, *args: np.ndarray):
-    """Call an IREE module.main() and return numpy outputs as a tuple."""
+def _call(module, *args: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Call an IREE module.main() and return float32 numpy outputs as a tuple.
+
+    Outputs are always cast to float32 so that downstream Python (DPM solver,
+    CFG math, EOS logistic) works regardless of whether the module is fp16.
+    """
     result = module.main(*args)
     # iree.runtime may return a single array or a tuple
     if isinstance(result, (list, tuple)):
-        return tuple(np.array(r) for r in result)
-    return (np.array(result),)
+        return tuple(np.array(r, dtype=np.float32) if np.array(r).dtype.kind == 'f'
+                     else np.array(r) for r in result)
+    arr = np.array(result)
+    return (arr.astype(np.float32) if arr.dtype.kind == 'f' else arr,)
+
+
+def _cast_fp(arr: np.ndarray, fp16: bool) -> np.ndarray:
+    """Cast a float array to float16 or float32 depending on fp16 flag."""
+    if arr.dtype.kind != 'f':
+        return arr  # integers pass through unchanged
+    return arr.astype(np.float16 if fp16 else np.float32)
 
 
 # ── KV cache helpers ──────────────────────────────────────────────────────────
@@ -207,16 +221,23 @@ class IREEVibeVoiceInference:
         self,
         vmfb_dir: str | Path,
         backend: str = "cpu",
+        fp16: bool = True,
     ) -> None:
         driver = IREE_DRIVER_MAP.get(backend, "local-task")
         d = Path(vmfb_dir)
 
-        print(f"Loading IREE components (backend={backend}) …")
-        self._text_lm   = _load_vmfb(d / f"text_lm_{backend}.vmfb",            driver)
-        self._tts_lm    = _load_vmfb(d / f"tts_lm_{backend}.vmfb",             driver)
-        self._connector = _load_vmfb(d / f"acoustic_connector_{backend}.vmfb",  driver)
-        self._diff_head = _load_vmfb(d / f"diffusion_head_{backend}.vmfb",      driver)
-        self._vocoder   = _load_vmfb(d / f"vocoder_{backend}.vmfb",             driver)
+        # Vulkan FP16 artefacts use the suffix _vulkan_fp16 (set by export.py).
+        # CPU artefacts are always float32 regardless of the fp16 flag.
+        is_fp16_vulkan = (backend == "vulkan" and fp16)
+        suffix = f"{backend}_fp16" if is_fp16_vulkan else backend
+        self._fp16 = is_fp16_vulkan   # used to cast inputs before IREE calls
+
+        print(f"Loading IREE components (backend={backend}, fp16={is_fp16_vulkan}) …")
+        self._text_lm   = _load_vmfb(d / f"text_lm_{suffix}.vmfb",            driver)
+        self._tts_lm    = _load_vmfb(d / f"tts_lm_{suffix}.vmfb",             driver)
+        self._connector = _load_vmfb(d / f"acoustic_connector_{suffix}.vmfb",  driver)
+        self._diff_head = _load_vmfb(d / f"diffusion_head_{suffix}.vmfb",      driver)
+        self._vocoder   = _load_vmfb(d / f"vocoder_{suffix}.vmfb",             driver)
         print("  All components loaded.")
 
         # Load DPM betas from nenad102_onnx (pre-computed)
@@ -250,7 +271,7 @@ class IREEVibeVoiceInference:
         lm_values:      list[np.ndarray],
     ) -> tuple[np.ndarray, list[np.ndarray], list[np.ndarray]]:
         """Returns (last_hidden_state, new_lm_keys, new_lm_values)."""
-        flat_kv = [a for pair in zip(lm_keys, lm_values) for a in pair]
+        flat_kv = [_cast_fp(a, self._fp16) for pair in zip(lm_keys, lm_values) for a in pair]
         outs = _call(self._text_lm, input_ids, cache_position, *flat_kv)
         hidden = outs[0]
         new_keys   = [outs[1 + 2*i] for i in range(N_LM_LAYERS)]
@@ -268,8 +289,8 @@ class IREEVibeVoiceInference:
         tts_values:     list[np.ndarray],
     ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
         """Returns (last_hidden_state, eos_logit, new_keys, new_values)."""
-        flat_kv = [a for pair in zip(tts_keys, tts_values) for a in pair]
-        outs = _call(self._tts_lm, lm_hidden, tts_mask, cache_position, *flat_kv)
+        flat_kv = [_cast_fp(a, self._fp16) for pair in zip(tts_keys, tts_values) for a in pair]
+        outs = _call(self._tts_lm, _cast_fp(lm_hidden, self._fp16), tts_mask, cache_position, *flat_kv)
         hidden    = outs[0]   # (1, seq, hidden)
         eos_logit = outs[1]   # (1, 1)
         new_keys   = [outs[2 + 2*i] for i in range(N_TTS_LAYERS)]
@@ -285,7 +306,12 @@ class IREEVibeVoiceInference:
         condition: np.ndarray,   # (2, 896)
     ) -> np.ndarray:             # (2, 64)
         t = np.array([float(timestep), float(timestep)], dtype=np.float32)
-        outs = _call(self._diff_head, noisy, t, condition)
+        outs = _call(
+            self._diff_head,
+            _cast_fp(noisy, self._fp16),
+            _cast_fp(t, self._fp16),
+            _cast_fp(condition, self._fp16),
+        )
         return outs[0]
 
     # ── Sample one speech latent via DPM-Solver++ with CFG ────────────────────
@@ -322,7 +348,7 @@ class IREEVibeVoiceInference:
 
     def _run_connector(self, latent: np.ndarray) -> np.ndarray:
         """latent: (1, 1, 64) → embed: (1, 1, 896)"""
-        outs = _call(self._connector, latent)
+        outs = _call(self._connector, _cast_fp(latent, self._fp16))
         return outs[0]
 
     # ── Vocoder ───────────────────────────────────────────────────────────────
@@ -335,7 +361,7 @@ class IREEVibeVoiceInference:
         """
         latent_seq = np.concatenate(all_latents, axis=0)           # (N, 64)
         latent_seq = latent_seq[np.newaxis, :, :]                   # (1, N, 64)
-        outs = _call(self._vocoder, latent_seq.astype(np.float32))
+        outs = _call(self._vocoder, _cast_fp(latent_seq, self._fp16))
         waveform = outs[0].flatten().astype(np.float32)
         return waveform
 
@@ -548,6 +574,7 @@ def generate_speech(
     output_path:     str | Path,
     vmfb_dir:        str | Path = EXPORT_DIR,
     backend:         str        = "cpu",
+    fp16:            bool       = True,
     cfg_scale:       float      = CFG_SCALE_DEF,
     verbose:         bool       = True,
 ) -> str:
@@ -572,7 +599,7 @@ def generate_speech(
         import scipy.io.wavfile as _wav
         sf = None
 
-    engine = IREEVibeVoiceInference(vmfb_dir=vmfb_dir, backend=backend)
+    engine = IREEVibeVoiceInference(vmfb_dir=vmfb_dir, backend=backend, fp16=fp16)
 
     start = time.time()
     waveform = engine.generate(
@@ -612,6 +639,10 @@ def main() -> None:
     parser.add_argument("--output",  default="output_iree.wav", help="Output WAV path")
     parser.add_argument("--vmfb_dir", default=str(EXPORT_DIR), help="Dir with .vmfb files")
     parser.add_argument("--backend", choices=["cpu", "vulkan"], default="cpu")
+    parser.add_argument(
+        "--fp16", action=argparse.BooleanOptionalAction, default=True,
+        help="Load *_vulkan_fp16.vmfb files and cast float inputs to float16 (default: True)",
+    )
     parser.add_argument("--cfg_scale", type=float, default=CFG_SCALE_DEF)
     args = parser.parse_args()
 
@@ -621,6 +652,7 @@ def main() -> None:
         output_path=args.output,
         vmfb_dir=args.vmfb_dir,
         backend=args.backend,
+        fp16=args.fp16,
         cfg_scale=args.cfg_scale,
         verbose=True,
     )
