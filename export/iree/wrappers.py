@@ -13,6 +13,11 @@ Design goals:
 Layer counts (VibeVoice-Realtime-0.5B, verified from nenad102_onnx/config.json):
   text_lm  : 4 Qwen2 layers  →  8  KV tensors
   tts_lm   : 20 Qwen2 layers → 40  KV tensors
+
+TTSLMPairedWrapper — fuses positive + negative CFG paths into one IREE call to
+  halve the Python/IREE/GPU-command-buffer overhead for the dominant bottleneck.
+  Both paths share the same model weights but carry independent KV caches with
+  potentially different sequence lengths (pos >> neg at generation start).
 """
 from __future__ import annotations
 
@@ -167,6 +172,80 @@ class TTSLMWrapper(nn.Module):
 
         new_flat = _unpack_dynamic_cache(outputs.past_key_values)
         return (hidden, eos, *new_flat)
+
+
+# ── Paired TTS-LM wrapper (pos + neg CFG in one IREE call) ───────────────────
+
+# Number of KV tensors per TTS-LM path: 2 * N_TTS_LAYERS = 40
+_TTS_KV_PER_PATH = 40  # updated from infer constants at load time
+
+
+class TTSLMPairedWrapper(nn.Module):
+    """
+    Fuses the positive (conditioned) and negative (unconditioned CFG) TTS-LM
+    forward passes into a **single** IREE call.
+
+    Motivation: the speech-token decode loop calls the TTS-LM twice per step
+    (once for each CFG path).  Each IREE call carries significant Python/runtime
+    overhead (GPU command-buffer record + submit + sync).  Fusing both paths
+    into one call halves that overhead — the dominant cost in autoregressive
+    single-token decoding.
+
+    Both paths use the **same model weights** but carry **independent KV caches**
+    with potentially different sequence lengths (the positive cache starts at the
+    full voice-prompt length; the negative cache starts at 1).  torch.export is
+    called with ``Dim.DYNAMIC`` for both KV dims so that no constraint is placed
+    on their relative lengths.
+
+    Inputs (flat):
+        pos_hidden      : (1, seq, hidden)
+        pos_mask        : (1, seq)   int64
+        pos_cache_pos   : (seq,)     int64
+        neg_hidden      : (1, seq, hidden)
+        neg_mask        : (1, seq)   int64
+        neg_cache_pos   : (seq,)     int64
+        *pos_kv_flat    : 40 interleaved (k,v) tensors for the positive path
+        *neg_kv_flat    : 40 interleaved (k,v) tensors for the negative path
+
+    Outputs (flat, positive then negative):
+        pos_last_hidden : (1, seq, hidden)
+        pos_eos_logit   : (1, 1)
+        *pos_new_kv     : 40 updated KV tensors for the positive path
+        neg_last_hidden : (1, seq, hidden)
+        neg_eos_logit   : (1, 1)   (ignored by caller; kept for API uniformity)
+        *neg_new_kv     : 40 updated KV tensors for the negative path
+    """
+
+    # Per-path KV tensor count (set from N_TTS_LAYERS at construction time)
+    _n_kv_per_path: int = 40
+
+    def __init__(self, tts_wrapper: "TTSLMWrapper", n_tts_layers: int = 20) -> None:
+        super().__init__()
+        self._n_kv_per_path = 2 * n_tts_layers
+        # Expose the shared sub-modules as two named attributes so that
+        # torch.export traces them as two distinct call sites with independent
+        # symbolic shapes for their respective KV sequences.
+        self.pos_lm = tts_wrapper
+        self.neg_lm = copy.copy(tts_wrapper)   # shallow copy — shares all nn.Parameters
+
+    def forward(
+        self,
+        pos_hidden:    torch.Tensor,   # (1, seq, hidden)
+        pos_mask:      torch.Tensor,   # (1, seq)     int64
+        pos_cache_pos: torch.Tensor,   # (seq,)        int64
+        neg_hidden:    torch.Tensor,   # (1, seq, hidden)
+        neg_mask:      torch.Tensor,   # (1, seq)     int64
+        neg_cache_pos: torch.Tensor,   # (seq,)        int64
+        *pos_neg_kv:   torch.Tensor,   # 2 × _n_kv_per_path tensors
+    ) -> Tuple[torch.Tensor, ...]:
+        n = self._n_kv_per_path
+        pos_kv = pos_neg_kv[:n]
+        neg_kv = pos_neg_kv[n:]
+
+        pos_out = self.pos_lm(pos_hidden, pos_mask, pos_cache_pos, *pos_kv)
+        neg_out = self.neg_lm(neg_hidden, neg_mask, neg_cache_pos, *neg_kv)
+
+        return pos_out + neg_out   # tuple concatenation
 
 
 # ── Acoustic-connector wrapper ────────────────────────────────────────────────
@@ -470,24 +549,28 @@ def build_wrappers(model: nn.Module) -> dict[str, nn.Module]:
     VibeVoiceStreamingForConditionalGenerationInference instance.
 
     Returns a dict keyed by component name:
-        "text_lm"           → TextLMWrapper
-        "tts_lm"            → TTSLMWrapper
-        "acoustic_connector"→ AcousticConnectorWrapper
-        "diffusion_head"    → DiffusionHeadWrapper
-        "vocoder"           → VocoderWrapper
+        "text_lm"            → TextLMWrapper
+        "tts_lm"             → TTSLMWrapper
+        "tts_lm_paired"      → TTSLMPairedWrapper (pos+neg CFG fused)
+        "acoustic_connector" → AcousticConnectorWrapper
+        "diffusion_head"     → DiffusionHeadWrapper
+        "vocoder"            → VocoderWrapper
     """
     m = model.model  # VibeVoiceStreamingModel
+
+    tts_wrapper = TTSLMWrapper(
+        tts_language_model=m.tts_language_model,
+        tts_input_types=m.tts_input_types,
+        eos_classifier=model.tts_eos_classifier,
+    )
 
     return {
         "text_lm": TextLMWrapper(
             model=m.language_model,
             embed_tokens=m.get_input_embeddings(),
         ),
-        "tts_lm": TTSLMWrapper(
-            tts_language_model=m.tts_language_model,
-            tts_input_types=m.tts_input_types,
-            eos_classifier=model.tts_eos_classifier,
-        ),
+        "tts_lm":        tts_wrapper,
+        "tts_lm_paired": TTSLMPairedWrapper(tts_wrapper, n_tts_layers=20),
         "acoustic_connector": AcousticConnectorWrapper(m.acoustic_connector),
         "diffusion_head":     DiffusionHeadWrapper(m.prediction_head),
         "vocoder": VocoderWrapper(

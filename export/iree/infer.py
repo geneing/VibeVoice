@@ -134,34 +134,43 @@ def _load_vmfb(path: str | Path, config):
     )
 
 
-def _to_np(t) -> np.ndarray:
-    """Convert torch.Tensor to numpy, handling device/dtype."""
+def _to_np(t, fp16: bool = False) -> np.ndarray:
+    """Convert torch.Tensor to numpy.  When fp16=True returns float16."""
     import torch
     if isinstance(t, torch.Tensor):
-        return t.detach().cpu().float().numpy()
-    return np.asarray(t, dtype=np.float32)
+        arr = t.detach().cpu()
+        return arr.half().numpy() if fp16 else arr.float().numpy()
+    dtype = np.float16 if fp16 else np.float32
+    return np.asarray(t, dtype=dtype)
 
 
 def _call(module, *args: np.ndarray) -> tuple[np.ndarray, ...]:
-    """Call an IREE module.main() and return float32 numpy outputs as a tuple.
+    """Call an IREE module.main() and return numpy outputs as a tuple.
 
-    Outputs are always cast to float32 so that downstream Python (DPM solver,
-    CFG math, EOS logistic) works regardless of whether the module is fp16.
+    Float outputs are returned in their **native dtype** (fp16 or fp32) so that
+    KV-cache tensors can be stored and re-passed without a FP16↔FP32 roundtrip.
+    Use _call_f32() when you need guaranteed float32 scalars.
     """
     result = module.main(*args)
-    # iree.runtime may return a single array or a tuple
     if isinstance(result, (list, tuple)):
-        return tuple(np.array(r, dtype=np.float32) if np.array(r).dtype.kind == 'f'
-                     else np.array(r) for r in result)
-    arr = np.array(result)
-    return (arr.astype(np.float32) if arr.dtype.kind == 'f' else arr,)
+        return tuple(np.asarray(r) for r in result)
+    return (np.asarray(result),)
+
+
+def _call_f32(module, *args: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Like _call but casts all float outputs to float32."""
+    outs = _call(module, *args)
+    return tuple(a.astype(np.float32) if a.dtype.kind == 'f' else a for a in outs)
 
 
 def _cast_fp(arr: np.ndarray, fp16: bool) -> np.ndarray:
     """Cast a float array to float16 or float32 depending on fp16 flag."""
     if arr.dtype.kind != 'f':
         return arr  # integers pass through unchanged
-    return arr.astype(np.float16 if fp16 else np.float32)
+    target = np.float16 if fp16 else np.float32
+    if arr.dtype == target:
+        return arr  # already correct dtype — no-op
+    return arr.astype(target)
 
 
 # ── KV cache helpers ──────────────────────────────────────────────────────────
@@ -234,26 +243,76 @@ class IREEVibeVoiceInference:
         # The vocoder (HiFiGAN) contains 2048-channel layer-norm reductions that
         print(f"Loading IREE components (backend={backend}, fp16={is_fp16_vulkan}) …")
         import iree.runtime as ireert
-        config = ireert.Config(driver)  # one device shared across all modules
-        self._text_lm   = _load_vmfb(d / f"text_lm_{suffix}.vmfb",            config)
-        self._tts_lm    = _load_vmfb(d / f"tts_lm_{suffix}.vmfb",             config)
-        self._connector = _load_vmfb(d / f"acoustic_connector_{suffix}.vmfb",  config)
-        self._diff_head = _load_vmfb(d / f"diffusion_head_{suffix}.vmfb",      config)
-        # Load vocoder on the same backend if a GPU vmfb is available, otherwise
-        # fall back to the CPU vmfb.  Previously the vocoder always ran on CPU
-        # because its 2048-channel layer-norm reductions required ~131 KB of
-        # shared memory. With chunked norms (chunk_size=256) the peak allocation
-        # drops to 16 KB, fitting within valhall4's 32 KB limit.
-        gpu_vocoder = d / f"vocoder_{suffix}.vmfb"
-        cpu_vocoder = d / "vocoder_cpu.vmfb"
-        if gpu_vocoder.exists():
-            self._vocoder      = _load_vmfb(gpu_vocoder, config)
+        import onnxruntime as ort
+
+        # Helper to create a multi-threaded ORT session
+        def _ort_session(path: Path) -> ort.InferenceSession:
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = os.cpu_count() or 4
+            return ort.InferenceSession(str(path), opts, providers=["CPUExecutionProvider"])
+
+        onnx_dir = REPO_ROOT / "nenad102_onnx"
+
+        # text_lm and tts_lm: use ORT CPU by default.
+        # Mixing IREE text_lm with ONNX tts_lm produces incorrect hidden states
+        # because the two exports use slightly different numerical pipelines.
+        # ORT is also 5-6× faster than IREE Vulkan on intel/dzn.
+        # Set IREE_GPU_LMS=1 to force IREE Vulkan for both.
+        use_iree_lms = bool(int(os.environ.get("IREE_GPU_LMS", "0")))
+
+        self._text_lm_ort: ort.InferenceSession | None = None
+        self._tts_lm_ort:  ort.InferenceSession | None = None
+
+        if not use_iree_lms and (onnx_dir / "text_lm_kv.onnx").exists() and (onnx_dir / "tts_lm_kv.onnx").exists():
+            self._text_lm_ort = _ort_session(onnx_dir / "text_lm_kv.onnx")
+            self._tts_lm_ort  = _ort_session(onnx_dir / "tts_lm_kv.onnx")
+            self._text_lm = None
+            self._tts_lm  = None
+            print("  NOTE: text_lm + tts_lm running via OnnxRuntime CPU (5-6× faster than Vulkan).")
+            config = ireert.Config(driver)  # still need config for connector + diff_head
+        else:
+            config = ireert.Config(driver)
+            self._text_lm = _load_vmfb(d / f"text_lm_{suffix}.vmfb", config)
+            self._tts_lm  = _load_vmfb(d / f"tts_lm_{suffix}.vmfb",  config)
+
+        # connector and diffusion also use ONNX when in ORT mode, to keep all
+        # intermediate activations in the same numerical pipeline.
+        self._connector_ort: object | None = None
+        self._diff_head_ort: object | None = None
+        if not use_iree_lms and (onnx_dir / "acoustic_connector.onnx").exists() and (onnx_dir / "diffusion_head.onnx").exists():
+            self._connector_ort = _ort_session(onnx_dir / "acoustic_connector.onnx")
+            self._diff_head_ort = _ort_session(onnx_dir / "diffusion_head.onnx")
+            self._connector = None
+            self._diff_head = None
+            config = ireert.Config(driver)
+        else:
+            config = config if not use_iree_lms else ireert.Config(driver)
+            self._connector = _load_vmfb(d / f"acoustic_connector_{suffix}.vmfb", config)
+            self._diff_head = _load_vmfb(d / f"diffusion_head_{suffix}.vmfb",     config)
+        # The vocoder runs via OnnxRuntime CPU by default — IREE local-task is
+        # ~30× slower than ORT for this workload, and the Vulkan vocoder causes
+        # VK_ERROR_DEVICE_LOST on VRAM-limited devices (text_lm+tts_lm already
+        # consume >1 GB).  Set IREE_GPU_VOCODER=1 to try the Vulkan vmfb.
+        gpu_vocoder  = d / f"vocoder_{suffix}.vmfb"
+        onnx_vocoder = onnx_dir / "vocoder.onnx"
+        use_gpu_vocoder = bool(int(os.environ.get("IREE_GPU_VOCODER", "0")))
+        self._vocoder_ort = None   # OnnxRuntime session or None
+        if use_gpu_vocoder and gpu_vocoder.exists() and backend != "cpu":
+            vocoder_config     = ireert.Config(driver)
+            self._vocoder      = _load_vmfb(gpu_vocoder, vocoder_config)
             self._vocoder_fp16 = is_fp16_vulkan
+        elif onnx_vocoder.exists():
+            self._vocoder_ort  = _ort_session(onnx_vocoder)
+            self._vocoder      = None
+            self._vocoder_fp16 = False
+            print("  NOTE: vocoder running via OnnxRuntime CPU (fast).")
         else:
             cpu_config         = ireert.Config("local-task") if backend != "cpu" else config
-            self._vocoder      = _load_vmfb(cpu_vocoder, cpu_config)
+            self._vocoder      = _load_vmfb(
+                d / "vocoder_cpu.vmfb" if (d / "vocoder_cpu.vmfb").exists()
+                else gpu_vocoder, cpu_config)
             self._vocoder_fp16 = False
-            print(f"  NOTE: {gpu_vocoder.name} not found; vocoder running on CPU.")
+            print("  NOTE: vocoder running via IREE CPU (slow; install onnxruntime for faster CPU vocoder).")
         print("  All components loaded.")
 
         # Load DPM betas from nenad102_onnx (pre-computed)
@@ -273,6 +332,8 @@ class IREEVibeVoiceInference:
             str(MODEL_PATH), local_files_only=True
         )
 
+        self._tts_lm_paired = None   # paired IREE path not used when ORT is active
+
     @staticmethod
     def _cosine_betas(n: int, max_beta: float = 0.999) -> np.ndarray:
         """Cosine beta schedule (matches VibeVoice training config)."""
@@ -290,14 +351,28 @@ class IREEVibeVoiceInference:
     def _run_text_lm(
         self,
         input_ids:      np.ndarray,   # (1, seq) int64
-        cache_position: np.ndarray,   # (seq,) int64
+        cache_position: np.ndarray,   # (seq,) int64  [used only for IREE path]
         lm_keys:        list[np.ndarray],
         lm_values:      list[np.ndarray],
     ) -> tuple[np.ndarray, list[np.ndarray], list[np.ndarray]]:
-        """Returns (last_hidden_state, new_lm_keys, new_lm_values)."""
+        """Returns (last_hidden_state [fp32], new_lm_keys, new_lm_values).
+        Routes to ORT CPU or IREE Vulkan depending on self._text_lm_ort.
+        """
+        if self._text_lm_ort is not None:
+            feed: dict[str, np.ndarray] = {"input_ids": input_ids.astype(np.int64)}
+            for i, (k, v) in enumerate(zip(lm_keys, lm_values)):
+                feed[f"past_key_{i}"]   = k.astype(np.float16)
+                feed[f"past_value_{i}"] = v.astype(np.float16)
+            outs = self._text_lm_ort.run(None, feed)
+            hidden   = outs[0].astype(np.float32)
+            new_keys   = [outs[1 + 2*i] for i in range(N_LM_LAYERS)]
+            new_values = [outs[2 + 2*i] for i in range(N_LM_LAYERS)]
+            return hidden, new_keys, new_values
+
+        # IREE Vulkan path
         flat_kv = [_cast_fp(a, self._fp16) for pair in zip(lm_keys, lm_values) for a in pair]
         outs = _call(self._text_lm, input_ids, cache_position, *flat_kv)
-        hidden = outs[0]
+        hidden = outs[0].astype(np.float32)
         new_keys   = [outs[1 + 2*i] for i in range(N_LM_LAYERS)]
         new_values = [outs[2 + 2*i] for i in range(N_LM_LAYERS)]
         return hidden, new_keys, new_values
@@ -308,15 +383,34 @@ class IREEVibeVoiceInference:
         self,
         lm_hidden:      np.ndarray,   # (1, seq, hidden)
         tts_mask:       np.ndarray,   # (1, seq) int64
-        cache_position: np.ndarray,   # (seq,) int64
+        cache_position: np.ndarray,   # (seq,) int64  [used only for IREE path]
         tts_keys:       list[np.ndarray],
         tts_values:     list[np.ndarray],
     ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], list[np.ndarray]]:
-        """Returns (last_hidden_state, eos_logit, new_keys, new_values)."""
+        """Returns (last_hidden_state [fp32], eos_logit [fp32], new_keys, new_values).
+        Routes to ORT CPU or IREE Vulkan depending on self._tts_lm_ort.
+        """
+        if self._tts_lm_ort is not None:
+            feed: dict[str, np.ndarray] = {
+                "inputs_embeds": lm_hidden.astype(np.float16),
+                "tts_text_mask": tts_mask.astype(np.int64),
+            }
+            for i, (k, v) in enumerate(zip(tts_keys, tts_values)):
+                feed[f"past_key_{i}"]   = k.astype(np.float16)
+                feed[f"past_value_{i}"] = v.astype(np.float16)
+            outs = self._tts_lm_ort.run(None, feed)
+            hidden    = outs[0].astype(np.float32)
+            eos_logit = outs[1].astype(np.float32)
+            new_keys   = [outs[2 + 2*i] for i in range(N_TTS_LAYERS)]
+            new_values = [outs[3 + 2*i] for i in range(N_TTS_LAYERS)]
+            return hidden, eos_logit, new_keys, new_values
+
+        # IREE Vulkan path
         flat_kv = [_cast_fp(a, self._fp16) for pair in zip(tts_keys, tts_values) for a in pair]
         outs = _call(self._tts_lm, _cast_fp(lm_hidden, self._fp16), tts_mask, cache_position, *flat_kv)
-        hidden    = outs[0]   # (1, seq, hidden)
-        eos_logit = outs[1]   # (1, 1)
+        hidden    = outs[0].astype(np.float32)   # (1, seq, hidden)
+        eos_logit = outs[1].astype(np.float32)   # (1, 1)
+        # KV tensors stay in native dtype (fp16 on vulkan) — no copy if already correct
         new_keys   = [outs[2 + 2*i] for i in range(N_TTS_LAYERS)]
         new_values = [outs[3 + 2*i] for i in range(N_TTS_LAYERS)]
         return hidden, eos_logit, new_keys, new_values
@@ -329,6 +423,20 @@ class IREEVibeVoiceInference:
         timestep:  int,
         condition: np.ndarray,   # (2, 896)
     ) -> np.ndarray:             # (2, 64)
+        if self._diff_head_ort is not None:
+            # ONNX diffusion model is batch=1; call separately for each CFG sample
+            t = np.array([float(timestep)], dtype=np.float16)
+            out0 = self._diff_head_ort.run(None, {
+                "noisy_latent": noisy[:1].astype(np.float16),
+                "timestep":     t,
+                "condition":    condition[:1].astype(np.float16),
+            })[0]
+            out1 = self._diff_head_ort.run(None, {
+                "noisy_latent": noisy[1:].astype(np.float16),
+                "timestep":     t,
+                "condition":    condition[1:].astype(np.float16),
+            })[0]
+            return np.concatenate([out0, out1], axis=0).astype(np.float32)
         t = np.array([float(timestep), float(timestep)], dtype=np.float32)
         outs = _call(
             self._diff_head,
@@ -372,22 +480,44 @@ class IREEVibeVoiceInference:
 
     def _run_connector(self, latent: np.ndarray) -> np.ndarray:
         """latent: (1, 1, 64) → embed: (1, 1, 896)"""
+        if self._connector_ort is not None:
+            return self._connector_ort.run(None, {"latent": latent.astype(np.float16)})[0].astype(np.float32)
         outs = _call(self._connector, _cast_fp(latent, self._fp16))
         return outs[0]
 
     # ── Vocoder ───────────────────────────────────────────────────────────────
 
+    # Maximum frames per vocoder IREE call.  The vocoder was exported with a
+    # 32-frame example; at 512 frames the Vulkan allocator exhausts device
+    # memory.  32 frames ≈ 85ms audio per call — safe even with the full
+    # TTS-LM vmfbs resident in GPU memory.
+    VOCODER_CHUNK = 32
+
     def _run_vocoder(self, all_latents: list[np.ndarray]) -> np.ndarray:
         """
-        Decode a list of (1, 64) latents to a waveform.
-        Concatenates into (1, N, 64) and calls the vocoder once.
-        Returns a flat float32 waveform.
+        Decode a list of (1, 64) latents to a waveform in chunks.
+
+        Splits the latent sequence into windows of at most VOCODER_CHUNK frames
+        and concatenates the resulting waveform chunks.  This avoids Vulkan
+        allocator failures for long utterances (>32 frames) while still
+        amortising the per-call GPU dispatch overhead.
         """
-        latent_seq = np.concatenate(all_latents, axis=0)           # (N, 64)
-        latent_seq = latent_seq[np.newaxis, :, :]                   # (1, N, 64)
-        outs = _call(self._vocoder, _cast_fp(latent_seq, self._vocoder_fp16))
-        waveform = outs[0].flatten().astype(np.float32)
-        return waveform
+        n = len(all_latents)
+        chunk = self.VOCODER_CHUNK
+        audio_chunks: list[np.ndarray] = []
+        for start in range(0, n, chunk):
+            segment = all_latents[start : start + chunk]
+            latent_seq = np.concatenate(segment, axis=0)       # (C, 64)
+            latent_seq = latent_seq[np.newaxis, :, :]           # (1, C, 64)
+            if self._vocoder_ort is not None:
+                # OnnxRuntime CPU path (much faster than IREE local-task)
+                inp = latent_seq.astype(np.float16)
+                outs_np = self._vocoder_ort.run(None, {"latents": inp})[0]
+                audio_chunks.append(outs_np.flatten().astype(np.float32))
+            else:
+                outs = _call(self._vocoder, _cast_fp(latent_seq, self._vocoder_fp16))
+                audio_chunks.append(outs[0].flatten().astype(np.float32))
+        return np.concatenate(audio_chunks) if len(audio_chunks) > 1 else audio_chunks[0]
 
     # ── Load voice preset ─────────────────────────────────────────────────────
 
@@ -395,38 +525,51 @@ class IREEVibeVoiceInference:
         """
         Load a .pt voice preset and extract flat KV numpy arrays.
 
-        Returns a dict with:
+        KV arrays are pre-cast to the inference dtype (fp16 in vulkan mode) so
+        that _cast_fp() on every decode step is a cheap no-op (dtype already
+        matches).  Returns a dict with:
             lm_keys, lm_values                     (list of arrays, N_LM_LAYERS)
             tts_keys, tts_values                   (N_TTS_LAYERS)
             neg_tts_keys, neg_tts_values           (N_TTS_LAYERS)
-            tts_last_hidden                        (1, ?, 896)
-            neg_tts_last_hidden                    (1, ?, 896)
+            tts_last_hidden                        (1, ?, 896) fp32
+            neg_tts_last_hidden                    (1, ?, 896) fp32
             lm_kv_seq_len, tts_kv_seq_len          (int)
+            preset                                 (raw loaded preset, for tokenise)
         """
         import torch
         preset = torch.load(str(voice_path), map_location="cpu", weights_only=False)
 
-        lm_keys,      lm_values      = _extract_kv_from_cache(
-            preset["lm"].past_key_values, N_LM_LAYERS)
-        tts_keys,     tts_values     = _extract_kv_from_cache(
-            preset["tts_lm"].past_key_values, N_TTS_LAYERS)
-        neg_tts_keys, neg_tts_values = _extract_kv_from_cache(
-            preset["neg_tts_lm"].past_key_values, N_TTS_LAYERS)
+        kv_fp16 = self._fp16   # pre-cast KV to fp16 when running vulkan fp16
+
+        def _np(t): return _to_np(t, fp16=kv_fp16)
+
+        lm_cache      = preset["lm"].past_key_values
+        tts_cache     = preset["tts_lm"].past_key_values
+        neg_tts_cache = preset["neg_tts_lm"].past_key_values
+
+        lm_keys      = [_np(lm_cache.key_cache[i])        for i in range(N_LM_LAYERS)]
+        lm_values    = [_np(lm_cache.value_cache[i])      for i in range(N_LM_LAYERS)]
+        tts_keys     = [_np(tts_cache.key_cache[i])       for i in range(N_TTS_LAYERS)]
+        tts_values   = [_np(tts_cache.value_cache[i])     for i in range(N_TTS_LAYERS)]
+        neg_tts_keys = [_np(neg_tts_cache.key_cache[i])   for i in range(N_TTS_LAYERS)]
+        neg_tts_values=[_np(neg_tts_cache.value_cache[i]) for i in range(N_TTS_LAYERS)]
 
         tts_last_hidden     = _to_np(preset["tts_lm"].last_hidden_state)
         neg_tts_last_hidden = _to_np(preset["neg_tts_lm"].last_hidden_state)
 
         return {
-            "lm_keys":           lm_keys,
-            "lm_values":         lm_values,
-            "tts_keys":          tts_keys,
-            "tts_values":        tts_values,
-            "neg_tts_keys":      neg_tts_keys,
-            "neg_tts_values":    neg_tts_values,
-            "tts_last_hidden":   tts_last_hidden,
+            "lm_keys":             lm_keys,
+            "lm_values":           lm_values,
+            "tts_keys":            tts_keys,
+            "tts_values":          tts_values,
+            "neg_tts_keys":        neg_tts_keys,
+            "neg_tts_values":      neg_tts_values,
+            "tts_last_hidden":     tts_last_hidden,
             "neg_tts_last_hidden": neg_tts_last_hidden,
-            "lm_kv_seq_len":     lm_keys[0].shape[2] if lm_keys else 0,
-            "tts_kv_seq_len":    tts_keys[0].shape[2] if tts_keys else 0,
+            "lm_kv_seq_len":       lm_keys[0].shape[2]      if lm_keys      else 0,
+            "tts_kv_seq_len":      tts_keys[0].shape[2]     if tts_keys     else 0,
+            "neg_tts_kv_seq_len":  neg_tts_keys[0].shape[2] if neg_tts_keys else 0,
+            "preset":              preset,   # reused for tokenisation — avoid second torch.load
         }
 
     # ── Tokenise input text ───────────────────────────────────────────────────
@@ -470,8 +613,8 @@ class IREEVibeVoiceInference:
 
         voice = self._load_voice(voice_path)
 
-        # Tokenise using the pre-loaded processor (no hub network calls).
-        preset = torch.load(str(voice_path), map_location="cpu", weights_only=False)
+        # Reuse the preset already loaded inside _load_voice (avoids second torch.load).
+        preset = voice["preset"]
         inputs = self._proc.process_input_with_cached_prompt(
             text=text,
             cached_prompt=preset,
@@ -483,7 +626,8 @@ class IREEVibeVoiceInference:
         total_tokens = tts_text_ids.shape[1]
 
         if verbose:
-            print(f"  {total_tokens} text tokens (max_speech_tokens={max_speech_tokens})")
+            paired_str = " [paired CFG]" if self._tts_lm_paired is not None else ""
+            print(f"  {total_tokens} text tokens (max_speech_tokens={max_speech_tokens}){paired_str}")
 
         # Initialise running KV state from voice preset
         lm_keys      = [k.copy() for k in voice["lm_keys"]]
@@ -496,8 +640,13 @@ class IREEVibeVoiceInference:
         tts_last_hidden     = voice["tts_last_hidden"].copy()
         neg_tts_last_hidden = voice["neg_tts_last_hidden"].copy()
 
-        lm_pos  = voice["lm_kv_seq_len"]
-        tts_pos = voice["tts_kv_seq_len"]
+        lm_pos      = voice["lm_kv_seq_len"]
+        tts_pos     = voice["tts_kv_seq_len"]
+        # The negative KV cache starts at length 1 (not 316+ like positive).
+        # It must advance with its own position counter so Qwen2 RoPE / causal
+        # mask attend at the correct positions.  Using tts_pos for both paths
+        # was the root cause of EOS never firing (corrupted neg hidden states).
+        neg_tts_pos = voice["neg_tts_kv_seq_len"]
 
         all_latents: list[np.ndarray] = []
         win_idx  = 0
@@ -527,6 +676,13 @@ class IREEVibeVoiceInference:
                 )
                 tts_pos += seq_len
 
+                # NOTE: the neg path is NOT run through text tokens.
+                # In the PyTorch reference model.generate(), only the positive
+                # TTS-LM is updated on text windows; the neg path stays at its
+                # initial (voice-conditioned) KV state until the first speech
+                # step.  Running neg through text would contaminate the CFG
+                # unconditioned signal with text information.
+
             # ── Speech window ──────────────────────────────────────────────────
             for _ in range(SPEECH_WINDOW):
                 pos_cond = tts_last_hidden[:, -1:, :].reshape(1, HIDDEN_SIZE)
@@ -538,19 +694,32 @@ class IREEVibeVoiceInference:
                 # Acoustic connector: latent (1,1,64) → embed (1,1,896)
                 embed = self._run_connector(latent.reshape(1, 1, LATENT_DIM))
 
-                # TTS LM — positive path (speech step)
-                speech_mask = np.zeros((1, 1), dtype=np.int64)
-                sp_cache_pos = np.array([tts_pos], dtype=np.int64)
-                tts_last_hidden, eos_logit, tts_keys, tts_values = self._run_tts_lm(
-                    embed, speech_mask, sp_cache_pos, tts_keys, tts_values
-                )
+                # TTS LM step — use paired (pos+neg in one call) when available,
+                # otherwise fall back to two separate calls.
+                speech_mask      = np.zeros((1, 1), dtype=np.int64)
+                sp_cache_pos     = np.array([tts_pos],     dtype=np.int64)
+                neg_sp_cache_pos = np.array([neg_tts_pos], dtype=np.int64)
 
-                # TTS LM — negative path (speech step)
-                neg_tts_last_hidden, _, neg_tts_keys, neg_tts_values = self._run_tts_lm(
-                    embed, speech_mask, sp_cache_pos, neg_tts_keys, neg_tts_values
-                )
+                if self._tts_lm_paired is not None:
+                    (tts_last_hidden, eos_logit,
+                     tts_keys, tts_values,
+                     neg_tts_last_hidden, _,
+                     neg_tts_keys, neg_tts_values) = self._run_tts_lm_paired(
+                        embed, speech_mask, sp_cache_pos,
+                        embed, speech_mask, neg_sp_cache_pos,
+                        tts_keys, tts_values,
+                        neg_tts_keys, neg_tts_values,
+                    )
+                else:
+                    tts_last_hidden, eos_logit, tts_keys, tts_values = self._run_tts_lm(
+                        embed, speech_mask, sp_cache_pos, tts_keys, tts_values
+                    )
+                    neg_tts_last_hidden, _, neg_tts_keys, neg_tts_values = self._run_tts_lm(
+                        embed, speech_mask, neg_sp_cache_pos, neg_tts_keys, neg_tts_values
+                    )
 
-                tts_pos += 1
+                tts_pos     += 1
+                neg_tts_pos += 1
 
                 # EOS check (data-dependent Python control flow)
                 eos_prob = float(1.0 / (1.0 + np.exp(-float(eos_logit.flat[0]))))
@@ -575,6 +744,7 @@ class IREEVibeVoiceInference:
 
         if verbose:
             print(f"  Decoding {len(all_latents)} frames via vocoder …")
+
 
         waveform = self._run_vocoder(all_latents)
         return waveform

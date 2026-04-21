@@ -496,9 +496,61 @@ def _spec_vocoder(wrappers: dict) -> dict:
             "dynamic_shapes": dynamic_shapes}
 
 
+def _spec_tts_lm_paired(wrappers: dict) -> dict:
+    """
+    Export spec for TTSLMPairedWrapper — runs pos+neg CFG paths in one call.
+
+    Both pos and neg KV dims are independently DYNAMIC (they differ: pos starts
+    at the voice-prompt length ~316, neg starts at 1).  The pos path is exported
+    with kv_seq=128 and the neg path with kv_seq=4 to give torch.export concrete
+    but distinct example shapes.  seq=1 for both (speech-token decode step).
+    """
+    wrapper = wrappers["tts_lm_paired"]
+    seq = 1          # speech-token step: seq=1
+    pos_kv = 128     # example positive KV length
+    neg_kv = 4       # example negative KV length (starts small)
+
+    pos_kv_example = _kv_example(N_TTS_LAYERS, pos_kv)
+    neg_kv_example = _kv_example(N_TTS_LAYERS, neg_kv)
+
+    example_inputs = (
+        torch.zeros(1, seq, HIDDEN_SIZE),                           # pos_hidden
+        torch.zeros(1, seq, dtype=torch.long),                      # pos_mask
+        torch.arange(pos_kv, pos_kv + seq, dtype=torch.long),      # pos_cache_pos
+        torch.zeros(1, seq, HIDDEN_SIZE),                           # neg_hidden
+        torch.zeros(1, seq, dtype=torch.long),                      # neg_mask
+        torch.arange(neg_kv, neg_kv + seq, dtype=torch.long),      # neg_cache_pos
+        *pos_kv_example,
+        *neg_kv_example,
+    )
+
+    dyn = torch.export.Dim.DYNAMIC  # both seq and KV lengths fully dynamic
+    pos_kv_shapes: list[dict] = []
+    neg_kv_shapes: list[dict] = []
+    for _ in range(N_TTS_LAYERS):
+        pos_kv_shapes.append({2: dyn})
+        pos_kv_shapes.append({2: dyn})
+        neg_kv_shapes.append({2: dyn})
+        neg_kv_shapes.append({2: dyn})
+
+    dynamic_shapes = (
+        None,                        # pos_hidden  (1, 1, hidden) — seq=1 static
+        None,                        # pos_mask    (1, 1) — static
+        None,                        # pos_cache_pos (1,) — static
+        None,                        # neg_hidden  — static
+        None,                        # neg_mask    — static
+        None,                        # neg_cache_pos — static
+        # *pos_neg_kv is a single variadic arg — only KV dim 2 is dynamic
+        tuple(pos_kv_shapes + neg_kv_shapes),
+    )
+    return {"wrapper": wrapper, "example_inputs": example_inputs,
+            "dynamic_shapes": dynamic_shapes}
+
+
 COMPONENT_SPECS = {
     "text_lm":            _spec_text_lm,
     "tts_lm":             _spec_tts_lm,
+    "tts_lm_paired":      _spec_tts_lm_paired,
     "acoustic_connector": _spec_acoustic_connector,
     "diffusion_head":     _spec_diffusion_head,
     "vocoder":            _spec_vocoder,
