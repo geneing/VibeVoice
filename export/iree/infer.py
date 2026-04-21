@@ -232,12 +232,6 @@ class IREEVibeVoiceInference:
         self._fp16 = is_fp16_vulkan   # used to cast inputs before IREE calls
 
         # The vocoder (HiFiGAN) contains 2048-channel layer-norm reductions that
-        # require ~128 KB of shared memory — more than any Vulkan GPU preset
-        # provides.  Run it on CPU regardless of the chosen backend.
-        # The vocoder is called once at the end of generation, so CPU latency
-        # is acceptable.
-        self._vocoder_fp16 = False  # vocoder always runs fp32 on CPU
-
         print(f"Loading IREE components (backend={backend}, fp16={is_fp16_vulkan}) …")
         import iree.runtime as ireert
         config = ireert.Config(driver)  # one device shared across all modules
@@ -245,9 +239,21 @@ class IREEVibeVoiceInference:
         self._tts_lm    = _load_vmfb(d / f"tts_lm_{suffix}.vmfb",             config)
         self._connector = _load_vmfb(d / f"acoustic_connector_{suffix}.vmfb",  config)
         self._diff_head = _load_vmfb(d / f"diffusion_head_{suffix}.vmfb",      config)
-        # Vocoder always on CPU (see note above).
-        cpu_config = ireert.Config("local-task") if backend != "cpu" else config
-        self._vocoder   = _load_vmfb(d / "vocoder_cpu.vmfb", cpu_config)
+        # Load vocoder on the same backend if a GPU vmfb is available, otherwise
+        # fall back to the CPU vmfb.  Previously the vocoder always ran on CPU
+        # because its 2048-channel layer-norm reductions required ~131 KB of
+        # shared memory. With chunked norms (chunk_size=256) the peak allocation
+        # drops to 16 KB, fitting within valhall4's 32 KB limit.
+        gpu_vocoder = d / f"vocoder_{suffix}.vmfb"
+        cpu_vocoder = d / "vocoder_cpu.vmfb"
+        if gpu_vocoder.exists():
+            self._vocoder      = _load_vmfb(gpu_vocoder, config)
+            self._vocoder_fp16 = is_fp16_vulkan
+        else:
+            cpu_config         = ireert.Config("local-task") if backend != "cpu" else config
+            self._vocoder      = _load_vmfb(cpu_vocoder, cpu_config)
+            self._vocoder_fp16 = False
+            print(f"  NOTE: {gpu_vocoder.name} not found; vocoder running on CPU.")
         print("  All components loaded.")
 
         # Load DPM betas from nenad102_onnx (pre-computed)

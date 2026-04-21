@@ -16,6 +16,7 @@ Layer counts (VibeVoice-Realtime-0.5B, verified from nenad102_onnx/config.json):
 """
 from __future__ import annotations
 
+import copy
 from typing import Tuple
 
 import torch
@@ -221,6 +222,186 @@ class DiffusionHeadWrapper(nn.Module):
         return self.head(noisy_latents, timesteps, condition)
 
 
+# ── Chunked norm replacements ─────────────────────────────────────────────────
+#
+# Problem: IREE's Vulkan reduction kernel allocates shared memory proportional to
+# (spatial_tile × reduction_width × sizeof(dtype)).  For the vocoder's 2048-channel
+# ConvRMSNorm layers IREE allocates ~131 KB — far exceeding valhall4's 32 KB limit.
+#
+# Fix: replace large-channel norms with these chunked equivalents before export.
+# Each chunked norm splits the C-wide reduction into ⌈C/chunk_size⌉ smaller
+# reductions (≤ chunk_size elements), then sums the partial results.  The maths
+# are identical to the originals; only the order of summation differs.
+#
+# Shared-memory budget with chunk_size=256 and valhall4 (32 KB):
+#   fp32: tile=16 × 256 × 4 bytes = 16 KB  ≤ 32 KB  ✓
+#   fp16: tile=16 × 256 × 2 bytes =  8 KB  ≤ 32 KB  ✓
+
+class ChunkedConvRMSNorm(nn.Module):
+    """
+    Numerically equivalent replacement for ConvRMSNorm that decomposes the
+    channel-wise mean-of-squares reduction into chunks of ``chunk_size``
+    channels, keeping per-kernel shared memory within Vulkan limits.
+
+    Input / output layout: (B, C, T) — channel-first, matching ConvRMSNorm.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        chunk_size: int = 256,
+        weight: torch.Tensor | None = None,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.chunk_size = chunk_size
+        if elementwise_affine:
+            self.weight = nn.Parameter(
+                weight.clone() if weight is not None else torch.ones(dim)
+            )
+        else:
+            self.register_parameter("weight", None)
+
+    @classmethod
+    def from_module(
+        cls, module: nn.Module, chunk_size: int = 256
+    ) -> "ChunkedConvRMSNorm":
+        """Construct from an existing ConvRMSNorm / RMSNorm, copying weights."""
+        return cls(
+            dim=module.dim,
+            eps=module.eps,
+            elementwise_affine=module.elementwise_affine,
+            chunk_size=chunk_size,
+            weight=module.weight.data if module.weight is not None else None,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(1, 2)        # (B, C, T) → (B, T, C)
+        x_f = x.float()
+        C  = self.dim
+        cs = self.chunk_size
+
+        # Chunked sum-of-squares: each .sum(-1) reduces ≤ chunk_size elements
+        sq_sum = x_f[..., :cs].pow(2).sum(-1, keepdim=True)
+        for start in range(cs, C, cs):
+            sq_sum = sq_sum + x_f[..., start : start + cs].pow(2).sum(-1, keepdim=True)
+
+        rms_inv = torch.rsqrt(sq_sum * (1.0 / C) + self.eps)
+        out = (x_f * rms_inv).type_as(x)
+        if self.weight is not None:
+            out = out * self.weight
+        return out.transpose(1, 2)   # (B, T, C) → (B, C, T)
+
+
+class ChunkedConvLayerNorm(nn.Module):
+    """
+    Numerically equivalent replacement for ConvLayerNorm that decomposes
+    the channel-wise mean and variance reductions into chunks of
+    ``chunk_size`` channels.
+
+    Input / output layout: (B, C, T) — channel-first, matching ConvLayerNorm.
+    """
+
+    def __init__(
+        self,
+        num_channels: int,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        chunk_size: int = 256,
+        weight: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
+    ) -> None:
+        super().__init__()
+        self.num_channels = num_channels
+        self.eps = eps
+        self.chunk_size = chunk_size
+        if elementwise_affine:
+            self.weight = nn.Parameter(
+                weight.clone() if weight is not None else torch.ones(num_channels)
+            )
+            self.bias = nn.Parameter(
+                bias.clone() if bias is not None else torch.zeros(num_channels)
+            )
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    @classmethod
+    def from_module(
+        cls, module: nn.Module, chunk_size: int = 256
+    ) -> "ChunkedConvLayerNorm":
+        """Construct from an existing ConvLayerNorm, copying weights."""
+        ea = module.elementwise_affine
+        return cls(
+            num_channels=module.normalized_shape[0],
+            eps=module.eps,
+            elementwise_affine=ea,
+            chunk_size=chunk_size,
+            weight=module.weight.data if ea and module.weight is not None else None,
+            bias=module.bias.data   if ea and module.bias  is not None else None,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(1, 2)        # (B, C, T) → (B, T, C)
+        x_f = x.float()
+        C  = self.num_channels
+        cs = self.chunk_size
+        inv_C = 1.0 / C
+
+        # Chunked mean
+        total_sum = x_f[..., :cs].sum(-1, keepdim=True)
+        for start in range(cs, C, cs):
+            total_sum = total_sum + x_f[..., start : start + cs].sum(-1, keepdim=True)
+        mean = total_sum * inv_C
+
+        # Chunked E[x²] for variance
+        total_sq = x_f[..., :cs].pow(2).sum(-1, keepdim=True)
+        for start in range(cs, C, cs):
+            total_sq = total_sq + x_f[..., start : start + cs].pow(2).sum(-1, keepdim=True)
+        var = total_sq * inv_C - mean.pow(2)
+
+        out = (x_f - mean) * torch.rsqrt(var + self.eps)
+        if self.weight is not None:
+            out = out * self.weight.float() + self.bias.float()
+        return out.type_as(x).transpose(1, 2)   # (B, T, C) → (B, C, T)
+
+
+def patch_large_norms(
+    module: nn.Module,
+    max_channels: int = 512,
+    chunk_size: int = 256,
+) -> nn.Module:
+    """
+    Walk ``module`` recursively and replace ConvRMSNorm / ConvLayerNorm
+    instances whose channel count exceeds ``max_channels`` with their
+    chunked equivalents.
+
+    Called on the vocoder's acoustic_tokenizer before export so that the
+    2048-channel norms in the first decoder stage compile successfully on
+    Vulkan targets with limited shared memory (e.g., valhall4: 32 KB).
+
+    The replacement is performed in-place on the module tree.  Pass a
+    deep-copied module to avoid mutating the original model weights.
+    """
+    from vibevoice.modular.modular_vibevoice_tokenizer import ConvLayerNorm, ConvRMSNorm
+
+    def _replace_children(parent: nn.Module) -> None:
+        for name, child in list(parent.named_children()):
+            if isinstance(child, ConvLayerNorm) and child.normalized_shape[0] > max_channels:
+                setattr(parent, name, ChunkedConvLayerNorm.from_module(child, chunk_size))
+                # No need to recurse — replacement has no further children to check.
+            elif isinstance(child, ConvRMSNorm) and child.dim > max_channels:
+                setattr(parent, name, ChunkedConvRMSNorm.from_module(child, chunk_size))
+            else:
+                _replace_children(child)
+
+    _replace_children(module)
+    return module
+
+
 # ── Vocoder wrapper ───────────────────────────────────────────────────────────
 
 def _unwrap_no_grad(fn):
@@ -254,14 +435,22 @@ class VocoderWrapper(nn.Module):
         acoustic_tokenizer: nn.Module,
         scaling_factor:     torch.Tensor,
         bias_factor:        torch.Tensor,
+        norm_chunk_size:    int = 256,
     ) -> None:
         super().__init__()
         self.acoustic_tokenizer = acoustic_tokenizer
+        # Replace large-channel norms (>512 ch) with chunked equivalents so
+        # that the Vulkan compiler generates reduction kernels that fit within
+        # the 32 KB shared-memory budget of targets such as valhall4.
+        # The 2048-channel ConvRMSNorm layers in decoder stage 0 are the main
+        # target; smaller norms are left unchanged.
+        # Patched in-place to avoid a costly deep-copy of the 1.3 GB decoder.
+        patch_large_norms(self.acoustic_tokenizer, max_channels=512, chunk_size=norm_chunk_size)
         self.register_buffer("scaling_factor", scaling_factor.clone().detach())
         self.register_buffer("bias_factor",    bias_factor.clone().detach())
         # Unwrap @torch.no_grad() on the decode method to prevent
         # 'wrap_with_set_grad_enabled' HOPs that iree-turbine cannot lower.
-        cls_decode = type(acoustic_tokenizer).decode
+        cls_decode = type(self.acoustic_tokenizer).decode
         self._raw_decode = _unwrap_no_grad(cls_decode)
 
     def forward(self, latents: torch.Tensor) -> torch.Tensor:
