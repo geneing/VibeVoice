@@ -152,12 +152,43 @@ output = uncond + cfg_scale * (cond - uncond)
 - Run `python -m onnxruntime.tools.check_onnx_model <file.onnx>` — zero warnings required.
 - Prefer FP16 where NNAPI supports it; fall back to FP32 for unsupported ops.
 
-### IREE (iree-turbine)
+### IREE (iree-turbine) — status: working end-to-end on Vulkan
 
 - Export path: `torch.export.export(model, ...)` → `iree.turbine.aot.export(...)` → `.mlir` → compile to `.vmfb`.
-- Initial correctness target: `llvm-cpu`.
-- Mobile GPU target: `vulkan-spirv`.
-- Quantisation: FP16 via `--iree-input-demote-f64-to-f32` + `--iree-opt-const-eval`.
+- All five components export and run correctly on Vulkan (`--vulkan-target valhall4`).
+- FP16 Vulkan: cast wrapper to `.half()` before `torch.export` so constants are natively f16 in
+  MLIR. Do **not** use `--iree-input-demote-f32-to-f16` — it causes `arith.constant`
+  type-verification failures in IREE.
+- CPU backend always uses FP32 (`llvm-cpu` with `--iree-llvmcpu-target-cpu=host`).
+- Run `uv run python export.py --backends cpu vulkan --vulkan-target valhall4` to regenerate all vmfbs.
+
+#### Known IREE torch.export issues and fixes (already applied)
+
+| Issue | Fix location |
+|---|---|
+| `Qwen2RotaryEmbedding.forward` uses `@torch.no_grad` / `autocast` HOPs | `_patch_qwen2_rope()` in `export.py` |
+| `create_causal_mask` uses `torch.vmap` HOPs | `_patch_create_causal_mask()` in `export.py` |
+| `math.ceil` nodes not lowerable by iree-turbine | `_replace_ceil_with_input()` graph pass in `export.py` |
+| `lazy_load_decompositions` appears as call_function node | `_remove_lazy_load_nodes()` graph pass in `export.py` |
+| Vocoder 2048-channel norms need 131 KB shared memory (exceeds all GPU limits) | `patch_large_norms()` + `ChunkedConvRMSNorm` / `ChunkedConvLayerNorm` in `wrappers.py` |
+| `VibeVoiceStreamingProcessor.from_pretrained` hits HuggingFace network on every call | Load once in `IREEEngine.__init__` with `local_files_only=True` in `infer.py` |
+
+#### Vulkan target selection
+
+| Target | Subgroup width | Shared mem | Notes |
+|---|---|---|---|
+| `valhall4` | 16-wide | 32 KB | **Recommended** — works for all 5 components with chunked norms |
+| `adreno` | 64-wide | 64 KB | Only for Qualcomm hardware; hangs Intel/dzn (WSL2) |
+| `none` / omit | 16-wide | 16 KB | Conservative `vp_android_baseline_2022`; attention reductions fail |
+
+#### vmfb file naming
+
+| Pattern | Backend | dtype |
+|---|---|---|
+| `<component>_cpu.vmfb` | llvm-cpu | fp32 |
+| `<component>_vulkan_fp16.vmfb` | vulkan-spirv | fp16 |
+
+`infer.py` automatically uses the GPU vmfb when it exists, falls back to the CPU vmfb with a printed note.
 
 ### LiteRT / TFLite (future)
 

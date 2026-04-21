@@ -25,7 +25,11 @@ demo/
 nenad102_onnx/        # Existing ONNX export (5-component split, numpy runtime)
 export/
   onnx/               # New ONNX export targeting mobile (ORT + NNAPI)
-  iree/               # IREE export via iree-turbine
+  iree/               # IREE export via iree-turbine  ← working end-to-end on Vulkan
+    export.py         # torch.export → MLIR → .vmfb for all 5 components
+    infer.py          # IREE inference engine (CPU + Vulkan, fp16 GPU)
+    wrappers.py       # nn.Module wrappers + ChunkedConvRMSNorm for Vulkan compat
+    export_manifest.json
   litert/             # LiteRT / TFLite export (future)
 eval/                 # Shared evaluation harness
 ```
@@ -112,8 +116,11 @@ The Kotlin Android layer is out of scope for this repository but the exports mus
 
 - **ONNX export**: opset ≥ 17, dynamic batch/sequence axes labelled, no unsupported ops for
   NNAPI EP. Run `python -m onnxruntime.tools.check_onnx_model` and fix all warnings.
-- **IREE export**: target `llvm-cpu` (for initial correctness), then `vulkan-spirv` or
-  `rocm` for GPU. Use `iree-turbine` (`torch.export` → MLIR → IREE).
+- **IREE export**: all five components compile and run on `vulkan-spirv` with
+  `--vulkan-target valhall4`. Use `iree-turbine` (`torch.export` → MLIR → IREE).
+  FP16 Vulkan is achieved by casting the wrapper to `.half()` before export — do **not**
+  use `--iree-input-demote-f32-to-f16`. See `export/iree/` for the full export pipeline
+  including all graph patches required to make torch.export work.
 - **LiteRT**: quantise to INT8 / FP16 using representative calibration data; confirm ops
   are supported by the GPU delegate.
 - Provide a `README.md` per export method documenting: how to export, how to run on-device,
